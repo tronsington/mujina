@@ -146,7 +146,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("Chain {chain}: {} chip response(s) in {timeout:?}", chips.len());
+    println!(
+        "Chain {chain}: {} chip response(s) in {timeout:?}",
+        chips.len()
+    );
     if chips.len() == 77 {
         println!("MATCHES expected 77 chips/chain.");
     } else {

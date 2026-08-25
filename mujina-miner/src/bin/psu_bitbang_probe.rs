@@ -65,12 +65,21 @@ const CMD_GET_HW_VERSION: u8 = 0x02;
 const CMD_GET_VOLTAGE: u8 = 0x03;
 const CMD_MEASURE_VOLTAGE: u8 = 0x04;
 const CMD_READ_STATE: u8 = 0x05;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "documents the full command set; not wired to a CLI subcommand yet"
+)]
 const CMD_READ_CAL: u8 = 0x06;
 const CMD_WATCHDOG: u8 = 0x81;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "state-changing command, deliberately not wired to the CLI yet"
+)]
 const CMD_SET_VOLTAGE: u8 = 0x83;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "state-changing command, deliberately not wired to the CLI yet"
+)]
 const CMD_WRITE_CAL: u8 = 0x86;
 
 const DAC_REF_VOLTS: f32 = 15.1084;
@@ -94,10 +103,16 @@ impl fmt::Display for ProtocolError {
             Self::Nak => write!(f, "PSU returned NAK (0xF5)"),
             Self::InvalidPreamble(b) => write!(f, "invalid preamble: {b:02X?}"),
             Self::InvalidLength { declared, actual } => {
-                write!(f, "invalid frame length: declared {declared}, actual {actual}")
+                write!(
+                    f,
+                    "invalid frame length: declared {declared}, actual {actual}"
+                )
             }
             Self::InvalidChecksum { expected, actual } => {
-                write!(f, "invalid checksum: expected 0x{expected:02X}, got 0x{actual:02X}")
+                write!(
+                    f,
+                    "invalid checksum: expected 0x{expected:02X}, got 0x{actual:02X}"
+                )
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NoValidResponse => write!(f, "no valid PSU response received"),
@@ -121,7 +136,9 @@ struct Frame {
 fn checksum(length: u8, command: u8, payload: &[u8]) -> u16 {
     payload
         .iter()
-        .fold(u16::from(length) + u16::from(command), |sum, b| sum + u16::from(*b))
+        .fold(u16::from(length) + u16::from(command), |sum, b| {
+            sum + u16::from(*b)
+        })
 }
 
 fn build_frame(command: u8, payload: &[u8]) -> Vec<u8> {
@@ -153,7 +170,9 @@ fn parse_frame(raw: &[u8]) -> Result<Frame, ProtocolError> {
         });
     }
     if raw[0] != PREAMBLE_LSB || raw[1] != PREAMBLE_MSB {
-        return Err(ProtocolError::InvalidPreamble(raw[..raw.len().min(2)].to_vec()));
+        return Err(ProtocolError::InvalidPreamble(
+            raw[..raw.len().min(2)].to_vec(),
+        ));
     }
 
     let declared_len = raw[2] as usize;
@@ -321,7 +340,12 @@ impl BitBangI2c {
     /// One full I2C_SMBUS_WRITE_BYTE_DATA-equivalent transaction:
     /// START, addr+W, register, data, STOP. Errors if the address or
     /// register byte isn't ACKed.
-    fn write_byte_transaction(&self, addr: u8, register: u8, data: u8) -> Result<(), ProtocolError> {
+    fn write_byte_transaction(
+        &self,
+        addr: u8,
+        register: u8,
+        data: u8,
+    ) -> Result<(), ProtocolError> {
         self.start()?;
         if !self.write_byte(addr << 1)? {
             self.stop()?;
@@ -369,7 +393,8 @@ impl Psu {
     fn exchange(&self, command: u8, payload: &[u8]) -> Result<Frame, ProtocolError> {
         let frame = build_frame(command, payload);
         for byte in frame {
-            self.bus.write_byte_transaction(self.address, self.write_register, byte)?;
+            self.bus
+                .write_byte_transaction(self.address, self.write_register, byte)?;
         }
 
         sleep(RESPONSE_DELAY);
@@ -426,7 +451,10 @@ impl Psu {
 
         let remaining = usize::from(length)
             .checked_sub(1)
-            .ok_or(ProtocolError::InvalidLength { declared: length as usize, actual: 0 })?;
+            .ok_or(ProtocolError::InvalidLength {
+                declared: length as usize,
+                actual: 0,
+            })?;
         for _ in 0..remaining {
             response.push(self.bus.read_byte_transaction(self.address)?);
         }
@@ -452,8 +480,11 @@ fn run(args: &[String]) -> Result<(), ProtocolError> {
     }
 
     if command == "scan-addr" {
-        let addr_hex = args.get(1).expect("usage: psu-bitbang-probe scan-addr <addr-hex>");
-        let addr = u8::from_str_radix(addr_hex.trim_start_matches("0x"), 16).expect("bad hex address");
+        let addr_hex = args
+            .get(1)
+            .expect("usage: psu-bitbang-probe scan-addr <addr-hex>");
+        let addr =
+            u8::from_str_radix(addr_hex.trim_start_matches("0x"), 16).expect("bad hex address");
         let bus = BitBangI2c::init()?;
         bus.start()?;
         let acked = bus.write_byte(addr << 1)?;
@@ -489,7 +520,10 @@ fn run(args: &[String]) -> Result<(), ProtocolError> {
         "measure-voltage" => {
             let frame = psu.exchange(CMD_MEASURE_VOLTAGE, &[])?;
             if frame.payload.len() < 2 {
-                return Err(ProtocolError::InvalidLength { declared: 2, actual: frame.payload.len() });
+                return Err(ProtocolError::InvalidLength {
+                    declared: 2,
+                    actual: frame.payload.len(),
+                });
             }
             let volts = decode_measured_voltage(frame.payload[0], frame.payload[1]);
             println!(
@@ -501,10 +535,16 @@ fn run(args: &[String]) -> Result<(), ProtocolError> {
         "read-state" => {
             let frame = psu.exchange(CMD_READ_STATE, &[])?;
             if frame.payload.len() < 2 {
-                return Err(ProtocolError::InvalidLength { declared: 2, actual: frame.payload.len() });
+                return Err(ProtocolError::InvalidLength {
+                    declared: 2,
+                    actual: frame.payload.len(),
+                });
             }
             let state = u16::from(frame.payload[0]) | (u16::from(frame.payload[1]) << 8);
-            println!("state=0x{state:04X} ({})", if state == 1 { "ON" } else { "OFF" });
+            println!(
+                "state=0x{state:04X} ({})",
+                if state == 1 { "ON" } else { "OFF" }
+            );
             println!("raw: {:02X?}", frame.raw);
         }
         "disable-watchdog" => {
