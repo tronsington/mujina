@@ -42,6 +42,57 @@ fn chain_tty(chain: u8) -> String {
     format!("/dev/ttyS{}", chain)
 }
 
+const EXPECTED_CHIPS: usize = 77;
+
+/// Per-chip addressed IoDriverStrength (register 0x58) / UartRelay
+/// (register 0x2C) writes, captured verbatim from a real successful
+/// bring-up (chain 3) via the `s19k-trace` ptrace tracer -- see
+/// HANDOFF.md's "Round 4". Only a subset of chips (roughly every 7th
+/// address) get written directly; UartRelay's own doc comment calls
+/// it "domain relay configuration", so this is very likely
+/// per-domain-boundary chip config that propagates internally to the
+/// rest of each domain, not a per-chip requirement -- but the exact
+/// semantics aren't understood yet, so this replays the real bytes
+/// rather than guessing which subset/values matter. (chip_address,
+/// register_address, raw wire data bytes).
+const DOMAIN_CONFIG_WRITES: &[(u8, bm13xx::protocol::RegisterAddress, [u8; 4])] = {
+    use bm13xx::protocol::RegisterAddress::{IoDriverStrength, UartRelay};
+    &[
+        (0x98, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x8a, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x7c, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x6e, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x60, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x52, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x44, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x36, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x28, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x1a, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x0c, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
+        (0x8c, UartRelay, [0x00, 0x15, 0x00, 0x03]),
+        (0x98, UartRelay, [0x00, 0x15, 0x00, 0x03]),
+        (0x7e, UartRelay, [0x00, 0x1c, 0x00, 0x03]),
+        (0x8a, UartRelay, [0x00, 0x1c, 0x00, 0x03]),
+        (0x70, UartRelay, [0x00, 0x23, 0x00, 0x03]),
+        (0x7c, UartRelay, [0x00, 0x23, 0x00, 0x03]),
+        (0x62, UartRelay, [0x00, 0x2a, 0x00, 0x03]),
+        (0x6e, UartRelay, [0x00, 0x2a, 0x00, 0x03]),
+        (0x54, UartRelay, [0x00, 0x31, 0x00, 0x03]),
+        (0x60, UartRelay, [0x00, 0x31, 0x00, 0x03]),
+        (0x46, UartRelay, [0x00, 0x38, 0x00, 0x03]),
+        (0x52, UartRelay, [0x00, 0x38, 0x00, 0x03]),
+        (0x38, UartRelay, [0x00, 0x3f, 0x00, 0x03]),
+        (0x44, UartRelay, [0x00, 0x3f, 0x00, 0x03]),
+        (0x2a, UartRelay, [0x00, 0x46, 0x00, 0x03]),
+        (0x36, UartRelay, [0x00, 0x46, 0x00, 0x03]),
+        (0x1c, UartRelay, [0x00, 0x4d, 0x00, 0x03]),
+        (0x28, UartRelay, [0x00, 0x4d, 0x00, 0x03]),
+        (0x0e, UartRelay, [0x00, 0x54, 0x00, 0x03]),
+        (0x1a, UartRelay, [0x00, 0x54, 0x00, 0x03]),
+        (0x00, UartRelay, [0x00, 0x5b, 0x00, 0x03]),
+    ]
+};
+
 fn sysfs_export(gpio: u32) -> io::Result<()> {
     if fs::metadata(format!("/sys/class/gpio/gpio{gpio}")).is_ok() {
         return Ok(());
@@ -62,6 +113,14 @@ fn sysfs_set_output_high(gpio: u32) -> io::Result<()> {
     std::thread::sleep(Duration::from_millis(50));
     fs::write(format!("/sys/class/gpio/gpio{gpio}/direction"), "out")?;
     fs::write(format!("/sys/class/gpio/gpio{gpio}/value"), "1")?;
+    Ok(())
+}
+
+fn sysfs_set_output_low(gpio: u32) -> io::Result<()> {
+    sysfs_export(gpio)?;
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(format!("/sys/class/gpio/gpio{gpio}/direction"), "out")?;
+    fs::write(format!("/sys/class/gpio/gpio{gpio}/value"), "0")?;
     Ok(())
 }
 
@@ -90,35 +149,116 @@ async fn main() -> anyhow::Result<()> {
         .map(|t| format!("/dev/{t}"))
         .unwrap_or_else(|| chain_tty(chain));
 
-    println!("Enabling chain {chain} via GPIO {gpio}...");
+    // A real reset pulse (low, then high), not just "set high" from
+    // whatever state the GPIO happened to already be in -- bosminer's
+    // own log calls this step "Resetting hash board", which implies
+    // an actual falling+rising edge, not an idempotent level set.
+    // Earlier rounds tried "set low before PSU on, high after" but
+    // never combined it with the corrected command order below.
+    println!("Resetting chain {chain}: GPIO {gpio} low...");
+    sysfs_set_output_low(gpio)?;
+    time::sleep(Duration::from_millis(200)).await;
+    println!("Releasing reset: GPIO {gpio} high...");
     sysfs_set_output_high(gpio)?;
+    // bosminer's own log shows ~2s between "Resetting hash board" and
+    // "Initializing hashchain" (its first UART command) -- matching
+    // that gap here in case chips need real settle time after reset
+    // before they're listening.
+    println!("Settling for 2s before UART traffic (matching bosminer's own observed gap)...");
+    time::sleep(Duration::from_millis(2000)).await;
 
     println!("Opening {tty} at {baud} baud...");
     let stream = SerialStream::new(&tty, baud)?;
     let (mut reader, writer, _control) = stream.split();
     let mut data_writer = FramedWrite::new(writer, bm13xx::FrameCodec);
 
-    // Real captured BM1362 firmware traffic (S19j Pro; see
-    // REFERENCE.md's "Multi-Chip Initialization" section and its
-    // [^chaininit] footnote) sends ONE VersionMask write, THEN
-    // discovery -- ChainInactive doesn't come until later, as part
-    // of the addressing/SetChipAddress step, not as a discovery
-    // prerequisite. Earlier attempts sent ChainInactive first and
-    // three VersionMask writes before discovery, copying bitaxe.rs's
-    // BM1370/S21-Pro-style pattern instead of the BM1362-specific
-    // captured sequence. Match the real capture here.
-    println!("Sending VersionMask (broadcast, x1, matching the real captured BM1362 sequence)...");
-    let version_mask_cmd = Command::WriteRegister {
-        broadcast: true,
-        chip_address: 0x00,
-        register: bm13xx::protocol::Register::VersionMask(
-            bm13xx::protocol::VersionMask::full_rolling(),
-        ),
-    };
-    data_writer.send(version_mask_cmd).await?;
-    time::sleep(Duration::from_millis(10)).await;
+    // Real captured sequence from bosminer's own successful bring-up
+    // (via a ptrace syscall tracer -- see HANDOFF.md's "Round 4").
+    // Every earlier attempt sent VersionMask then discover_chips() in
+    // isolation and got zero responses. The real firmware sends
+    // discover LAST, after every chip has already been individually
+    // addressed (SetChipAddress sweep) and individually configured
+    // (per-chip IoDriverStrength/UartRelay writes) -- not first. This
+    // replays that real sequence, byte-for-byte where the exact
+    // semantics aren't yet understood (the per-chip domain writes
+    // below), reusing typed Command/Register where they line up
+    // cleanly with existing register definitions.
+    println!("Sending VersionMask (broadcast, x3, matching the real capture)...");
+    for _ in 0..3 {
+        let version_mask_cmd = Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::VersionMask(
+                bm13xx::protocol::VersionMask::full_rolling(),
+            ),
+        };
+        data_writer.send(version_mask_cmd).await?;
+        time::sleep(Duration::from_millis(15)).await;
+    }
 
-    println!("Sending discover_chips (broadcast ChipId read) -- no ChainInactive first...");
+    println!("Sending InitControl (0xA8, broadcast, raw_value=0x00000700)...");
+    data_writer
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::InitControl,
+                &[0x00, 0x07, 0x00, 0x00],
+            ),
+        })
+        .await?;
+    time::sleep(Duration::from_millis(15)).await;
+
+    println!("Sending MiscControl (0x18, broadcast, raw_value=0x00c10fff)...");
+    data_writer
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::MiscControl,
+                &[0xff, 0x0f, 0xc1, 0x00],
+            ),
+        })
+        .await?;
+    time::sleep(Duration::from_millis(15)).await;
+
+    println!("Sending ChainInactive (broadcast, x3) -- enables daisy-chain addressing...");
+    for _ in 0..3 {
+        data_writer.send(Command::ChainInactive).await?;
+        time::sleep(Duration::from_millis(15)).await;
+    }
+
+    println!(
+        "Sending SetChipAddress sweep: {EXPECTED_CHIPS} chips, address 0x00 step 2 up to {:#04x}...",
+        (EXPECTED_CHIPS as u16 - 1) * 2
+    );
+    for i in 0..EXPECTED_CHIPS as u16 {
+        let chip_address = (i * 2) as u8;
+        data_writer
+            .send(Command::SetChipAddress { chip_address })
+            .await?;
+        time::sleep(Duration::from_millis(2)).await;
+    }
+
+    println!(
+        "Sending {} per-chip domain config writes (IoDriverStrength/UartRelay, replayed verbatim from the real capture -- semantics not yet understood)...",
+        DOMAIN_CONFIG_WRITES.len()
+    );
+    for &(chip_address, register_address, data) in DOMAIN_CONFIG_WRITES {
+        let register = bm13xx::protocol::Register::decode(register_address, &data);
+        data_writer
+            .send(Command::WriteRegister {
+                broadcast: false,
+                chip_address,
+                register,
+            })
+            .await?;
+        time::sleep(Duration::from_millis(2)).await;
+    }
+
+    println!(
+        "Sending discover_chips (broadcast ChipId read) -- as the LAST step, matching the real capture..."
+    );
     let discover_cmd = BM13xxProtocol::discover_chips();
     data_writer.send(discover_cmd).await?;
 

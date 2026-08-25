@@ -79,6 +79,28 @@ const TRACE_OPTIONS: c_long =
 const SYS_OPEN: u32 = 5;
 const SYS_WRITE: u32 = 4;
 const SYS_OPENAT: u32 = 322;
+const SYS_IOCTL: u32 = 54;
+
+// TCSETS2 = _IOW('T', 0x2B, struct termios2): dir=WRITE=1, type='T'
+// =0x54, nr=0x2B, size=44 in the generic Linux ioctl encoding. On
+// x86, this is the *only* way to set a non-standard baud rate like
+// 3,125,000, since plain `struct termios` has no room for it there.
+// But on ARM (and most non-x86 archs, which use the "generic"
+// asm-generic/termbits.h), plain `struct termios` *already* has the
+// same c_ispeed/c_ospeed fields and 44-byte layout as termios2 --
+// TCGETS2/SETS2 exist mainly for x86 compat, so glibc/musl's
+// tcsetattr() on this target most likely goes through plain TCSETS
+// (0x5402) instead. Decode both the same way; whichever one actually
+// appears settles which this platform uses.
+const TCSETS2: u32 = 0x402c_542b;
+const TCSETS: u32 = 0x5402;
+// termios/termios2 layout (asm-generic/termbits.h, what ARM Linux
+// uses for both): c_iflag/c_oflag/c_cflag/c_lflag (u32 x4), c_line
+// (u8), c_cc[19] (u8 x19), c_ispeed, c_ospeed (u32 x2) -- 44 bytes
+// total, no padding (offset 36 for c_ispeed is already 4-aligned).
+const TERMIOS2_LEN: usize = 44;
+const CBAUD_MASK: u32 = 0o010017;
+const BOTHER: u32 = 0o010000;
 
 /// Issue a raw ptrace(2) request via the syscall(2) wrapper, avoiding
 /// `libc::ptrace`'s C-variadic call-site ambiguity (see module docs).
@@ -373,6 +395,25 @@ fn log_syscall_entry(
                 elapsed.as_secs_f64()
             );
         }
+        SYS_IOCTL if a1 == TCSETS2 || a1 == TCSETS => {
+            // Both are "set" ioctls: the caller fully populates the
+            // termios struct *before* the kernel touches it, so it's
+            // safe to read at entry (unlike a GET ioctl, where the
+            // kernel fills the struct in as a side effect -- would
+            // need an exit-time read this tracer doesn't implement).
+            let path = fd_paths
+                .get(&a0)
+                .cloned()
+                .unwrap_or_else(|| format!("fd{a0}"));
+            let which = if a1 == TCSETS2 { "TCSETS2" } else { "TCSETS" };
+            let raw = read_bytes(mem, a2, TERMIOS2_LEN);
+            if let Some(baud) = decode_termios2_baud(&raw) {
+                println!(
+                    "[{:>8.3}] ioctl({path}, {which}) -> baud {baud}",
+                    elapsed.as_secs_f64()
+                );
+            }
+        }
         _ => {
             // Everything else: tallied, not printed per-call -- a
             // busy async runtime makes thousands of epoll/timer/etc.
@@ -451,4 +492,37 @@ fn read_cstr(mem: &mut File, addr: u32) -> String {
     let raw = read_bytes(mem, addr, 256);
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     String::from_utf8_lossy(&raw[..end]).into_owned()
+}
+
+/// Decode the requested baud rate out of a raw `struct termios2`
+/// (see `TERMIOS2_LEN`'s doc comment for the field layout). Returns
+/// `None` if `raw` is short (a failed/partial memory read).
+fn decode_termios2_baud(raw: &[u8]) -> Option<u32> {
+    if raw.len() < TERMIOS2_LEN {
+        return None;
+    }
+    let cflag = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    let ispeed = u32::from_le_bytes(raw[36..40].try_into().unwrap());
+    let cbaud = cflag & CBAUD_MASK;
+    if cbaud == BOTHER {
+        // Custom rate (the only way to express something like
+        // 3,125,000, which has no legacy Bxxx constant) -- c_ispeed
+        // carries the actual value directly, not an index.
+        return Some(ispeed);
+    }
+    // Standard Bxxx encoding (asm-generic/termbits.h); only the rates
+    // plausibly relevant to a BM13xx power-on/ramp sequence.
+    Some(match cbaud {
+        0o000000 => 0,
+        0o000015 => 9_600,
+        0o000016 => 19_200,
+        0o000017 => 38_400,
+        0o010001 => 57_600,
+        0o010002 => 115_200,
+        0o010003 => 230_400,
+        0o010012 => 1_500_000,
+        0o010013 => 2_000_000,
+        0o010015 => 3_000_000,
+        _ => return Some(u32::MAX - cbaud), // unrecognized -- tag distinctly rather than silently mislabel
+    })
 }
