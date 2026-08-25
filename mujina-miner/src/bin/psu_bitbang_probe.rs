@@ -30,12 +30,16 @@
 //!   measure-voltage         measured output voltage
 //!   read-state              PSU on/off state
 //!   disable-watchdog        disable the PSU's comms watchdog
+//!   output-on               enable PSU output (PSU_nEN / gpio437 low)
+//!   output-off              disable PSU output (PSU_nEN / gpio437 high)
 //!   scan-addr <addr-hex>    just check ACK at a given address (no data)
 //!
-//! State-changing commands (set-voltage, set-dac, enable-watchdog)
-//! are implemented in the protocol layer but deliberately not wired
-//! up to the CLI here -- read-only telemetry only, until there's a
-//! specific reason to change PSU output state live.
+//! `output-on`/`output-off` only ever toggle the existing DAC
+//! setpoint on or off -- they never change what voltage is
+//! configured. Voltage-changing commands (set-voltage, set-dac,
+//! enable-watchdog) are implemented in the protocol layer but
+//! deliberately not wired up to the CLI -- until there's a specific,
+//! deliberate reason to change the PSU's configured output voltage.
 
 use std::fmt;
 use std::fs;
@@ -53,6 +57,10 @@ const DEFAULT_PSU_ADDRESS: u8 = 0x10;
 const DEFAULT_PSU_WRITE_REGISTER: u8 = 0x11;
 const RESPONSE_DELAY: Duration = Duration::from_millis(500);
 const MAX_RESPONSE_ATTEMPTS: usize = 3;
+
+/// PSU_nEN, per /etc/init.d/S37board_setup. Active-low: 0 = output
+/// enabled, 1 = disabled.
+const PSU_ENABLE_GPIO: u32 = 437;
 
 // --- APW12 frame protocol (ported from amlogic-cb-tools/src/protocol.rs) ---
 
@@ -493,6 +501,20 @@ fn run(args: &[String]) -> Result<(), ProtocolError> {
         return Ok(());
     }
 
+    if command == "output-on" || command == "output-off" {
+        let enable = command == "output-on";
+        export(PSU_ENABLE_GPIO)?;
+        set_direction(PSU_ENABLE_GPIO, "out")?;
+        // Active-low: enable = drive low, disable = release high.
+        set_value(PSU_ENABLE_GPIO, !enable)?;
+        println!(
+            "PSU_nEN (gpio{PSU_ENABLE_GPIO}) driven {} -- output {}",
+            if enable { "low" } else { "high" },
+            if enable { "enabled" } else { "disabled" }
+        );
+        return Ok(());
+    }
+
     let psu = Psu::open(DEFAULT_PSU_ADDRESS)?;
     println!(
         "PSU at address 0x{:02x}, write register 0x{:02x} (bit-banged SCL=gpio{SCL} SDA=gpio{SDA})",
@@ -570,6 +592,8 @@ fn print_help() {
     println!("Commands:");
     println!("  help");
     println!("  scan-addr <addr-hex>   just check ACK at an address, no data exchange");
+    println!("  output-on              enable PSU output (PSU_nEN / gpio437 low)");
+    println!("  output-off             disable PSU output (PSU_nEN / gpio437 high)");
     println!("  get-fw");
     println!("  get-hw");
     println!("  get-voltage");
