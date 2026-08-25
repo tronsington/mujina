@@ -49,11 +49,28 @@ use std::time::{Duration, Instant};
 use nix::libc::{self, c_char, c_int, c_long, c_void, pid_t};
 
 const PTRACE_TRACEME: c_long = 0;
-const PTRACE_CONT: c_long = 7;
 const PTRACE_SETOPTIONS: c_long = 0x4200;
+const PTRACE_GETEVENTMSG: c_long = 0x4201;
 const PTRACE_GETREGS: c_long = 12;
 const PTRACE_SYSCALL: c_long = 24;
 const PTRACE_O_TRACESYSGOOD: c_long = 0x0000_0001;
+const PTRACE_O_TRACEFORK: c_long = 0x0000_0002;
+const PTRACE_O_TRACEVFORK: c_long = 0x0000_0004;
+const PTRACE_O_TRACECLONE: c_long = 0x0000_0008;
+const TRACE_OPTIONS: c_long =
+    PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE;
+
+// `bosminer` is an async Rust runtime and almost certainly spawns
+// worker threads for blocking hardware I/O (the same pattern our own
+// `linux_hw` code uses via `spawn_blocking`) -- confirmed the hard
+// way: an earlier single-threaded trace attempt sat idle for 100+
+// seconds while `bosminer`'s own log showed it had already
+// discovered all 77 chips per chain, in real time, on some other
+// thread this tracer never saw. `PTRACE_O_TRACECLONE` (plus FORK/
+// VFORK for safety) makes new threads/children automatically
+// tracees too; each is a distinct waitable pid multiplexed via
+// `waitpid(-1, ...)`, with its own independent enter/exit toggle
+// state (see `parent_trace`'s `entering` map).
 
 // Candidate ARM EABI syscall numbers, used only to decide which
 // already-logged calls to try to decode further -- see module docs.
@@ -142,66 +159,145 @@ fn child_exec(args: &[String]) -> ! {
     std::process::exit(1);
 }
 
-fn parent_trace(pid: pid_t) {
-    // Wait for the initial SIGTRAP from execve, then enable
-    // TRACESYSGOOD so syscall-stops are unambiguous.
-    let mut status: c_int = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+fn set_trace_options(pid: pid_t) {
     unsafe {
         raw_ptrace(
             PTRACE_SETOPTIONS,
             pid,
             std::ptr::null_mut(),
-            PTRACE_O_TRACESYSGOOD as *mut c_void,
+            TRACE_OPTIONS as *mut c_void,
+        );
+    }
+}
+
+fn parent_trace(main_pid: pid_t) {
+    // Wait for the initial SIGTRAP from execve, then enable
+    // TRACESYSGOOD (unambiguous syscall-stops) and TRACECLONE/FORK/
+    // VFORK (follow new threads -- see the const doc above).
+    let mut status: c_int = 0;
+    unsafe { libc::waitpid(main_pid, &mut status, 0) };
+    set_trace_options(main_pid);
+
+    // All threads of a process share one address space, so a single
+    // /proc/<any-tid>/mem handle against the main pid works for
+    // reading any traced thread's memory.
+    let mut mem =
+        File::open(format!("/proc/{main_pid}/mem")).expect("opening tracee /proc/pid/mem");
+    let mut fd_paths: HashMap<u32, String> = HashMap::new();
+    let mut other_syscalls: HashMap<u32, OtherSyscallStats> = HashMap::new();
+    // Per-thread enter/exit toggle -- each traced tid alternates
+    // independently, interleaved with every other tid's stops.
+    let mut entering: HashMap<pid_t, bool> = HashMap::from([(main_pid, true)]);
+    let start = Instant::now();
+    let mut last_summary = start;
+
+    unsafe {
+        raw_ptrace(
+            PTRACE_SYSCALL,
+            main_pid,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
     }
 
-    let mut mem = File::open(format!("/proc/{pid}/mem")).expect("opening tracee /proc/pid/mem");
-    let mut fd_paths: HashMap<u32, String> = HashMap::new();
-    let mut other_syscalls: HashMap<u32, OtherSyscallStats> = HashMap::new();
-    let start = Instant::now();
-    let mut last_summary = start;
-    let mut entering = true; // alternates enter/exit on each syscall-stop
-
     loop {
-        unsafe {
-            raw_ptrace(
-                PTRACE_SYSCALL,
-                pid,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+        let stopped_pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if stopped_pid < 0 {
+            break; // no more tracees left at all
         }
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited < 0 {
-            break;
-        }
+
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            println!("[{:>8.3}] child exited", start.elapsed().as_secs_f64());
-            break;
-        }
-        let stopped_by_syscall =
-            libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == (libc::SIGTRAP | 0x80);
-        if !stopped_by_syscall {
-            // A real signal, not a syscall-stop -- pass it through.
-            let sig = libc::WSTOPSIG(status);
-            unsafe {
-                raw_ptrace(PTRACE_CONT, pid, std::ptr::null_mut(), sig as *mut c_void);
+            entering.remove(&stopped_pid);
+            if stopped_pid == main_pid {
+                println!(
+                    "[{:>8.3}] main thread exited",
+                    start.elapsed().as_secs_f64()
+                );
+                break;
             }
             continue;
         }
 
-        if entering && let Some(regs) = get_regs(pid) {
+        if !libc::WIFSTOPPED(status) {
+            continue;
+        }
+
+        // A ptrace event stop (new thread/fork/vfork) encodes as
+        // status>>8 == (SIGTRAP | (event<<8)), per ptrace(2). Handled
+        // before the syscall-stop check below since it's a distinct
+        // stop reason, not a syscall boundary for `stopped_pid` itself.
+        let raw_event = (status >> 8) & 0xff;
+        if libc::WSTOPSIG(status) == libc::SIGTRAP && raw_event != 0 {
+            let mut new_tid: libc::c_ulong = 0;
+            unsafe {
+                raw_ptrace(
+                    PTRACE_GETEVENTMSG,
+                    stopped_pid,
+                    std::ptr::null_mut(),
+                    &mut new_tid as *mut libc::c_ulong as *mut c_void,
+                );
+            }
+            let new_tid = new_tid as pid_t;
+            if new_tid > 0 {
+                set_trace_options(new_tid);
+                entering.insert(new_tid, true);
+                println!(
+                    "[{:>8.3}] new thread/process {new_tid}",
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            unsafe {
+                raw_ptrace(
+                    PTRACE_SYSCALL,
+                    stopped_pid,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            continue;
+        }
+
+        let stopped_by_syscall = libc::WSTOPSIG(status) == (libc::SIGTRAP | 0x80);
+        if !stopped_by_syscall {
+            let sig = libc::WSTOPSIG(status);
+            // A bare SIGTRAP here (as opposed to SIGTRAP|0x80) is
+            // ptrace machinery, not a real signal -- e.g. a newly
+            // cloned thread's very first stop. Swallow it (data=0)
+            // rather than re-injecting a signal the tracee never
+            // actually sent itself; forward anything else untouched.
+            let inject = if sig == libc::SIGTRAP { 0 } else { sig };
+            unsafe {
+                raw_ptrace(
+                    PTRACE_SYSCALL,
+                    stopped_pid,
+                    std::ptr::null_mut(),
+                    inject as *mut c_void,
+                );
+            }
+            continue;
+        }
+
+        let was_entering = *entering.entry(stopped_pid).or_insert(true);
+        if was_entering && let Some(regs) = get_regs(stopped_pid) {
             log_syscall_entry(
                 &mut mem,
-                pid,
+                stopped_pid,
                 &regs,
                 &mut fd_paths,
                 &mut other_syscalls,
                 start.elapsed(),
             );
         }
-        entering = !entering;
+        entering.insert(stopped_pid, !was_entering);
+
+        unsafe {
+            raw_ptrace(
+                PTRACE_SYSCALL,
+                stopped_pid,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
 
         if last_summary.elapsed() > Duration::from_secs(10) {
             print_other_syscall_summary(&other_syscalls);
