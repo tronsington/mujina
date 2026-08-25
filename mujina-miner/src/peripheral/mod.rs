@@ -5,6 +5,7 @@
 //! (EMC2101), and other board management ICs. All drivers are generic
 //! over the hw_trait interfaces.
 
+pub mod apw12;
 pub mod emc2101;
 pub mod led;
 pub mod pmbus;
