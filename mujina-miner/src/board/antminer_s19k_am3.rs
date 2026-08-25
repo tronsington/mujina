@@ -10,21 +10,19 @@
 //! Full hardware map, GPIO/I2C addresses, and how each was confirmed:
 //! `s19k-pro-am3-hardware-notes.md` in the recon docs.
 //!
-//! **Chip discovery works and hash threads are wired up** (see
-//! `HANDOFF.md`'s "Round 5"/"Round 6"/"Round 7") -- the chips actually
-//! self-report as BM1366, not BM1362 as assumed earlier in the
-//! investigation. This driver powers the PSU, resets all three chains
-//! together (a real hardware requirement found in Round 5: a single
-//! chain enabled alone never responds, even at correct voltage), and
-//! creates one `BM13xxThread` per chain using a chain-shaped
-//! `ChipInitStrategy::Bm1366Chain` (see `asic/bm13xx/thread.rs`) that
-//! replays the real captured bring-up sequence. **Not yet a tuned,
-//! full-speed miner** -- see that strategy's doc comment for the
-//! specific known gaps (fixed conservative ~50MHz frequency rather
-//! than a verified ramp to nameplate, discovery-time baud rather than
-//! `bosminer`'s real 3.125Mbaud operating speed, per-chip calibration
-//! writes not replicated). Real, working, and safely conservative
-//! rather than fast.
+//! **Chip discovery works, real hash threads are wired up, and jobs
+//! dispatch correctly to real hardware -- but real chip hashing isn't
+//! confirmed yet** (see `HANDOFF.md`'s "Round 5" through "Round 8").
+//! The chips actually self-report as BM1366, not BM1362 as assumed
+//! earlier in the investigation. This driver powers the PSU, resets
+//! all three chains together (a real hardware requirement found in
+//! Round 5: a single chain enabled alone never responds, even at
+//! correct voltage), and creates one `BM13xxThread` per chain using a
+//! chain-shaped `ChipInitStrategy::Bm1366Chain` (see
+//! `asic/bm13xx/thread.rs`) that replays the real captured bring-up
+//! sequence, including a real (as of Round 8, untested-but-plausible)
+//! switch to `bosminer`'s real 3.125Mbaud operating speed. See that
+//! strategy's doc comment for the remaining specific known gaps.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +44,7 @@ use crate::{
         bm13xx::{
             self, BM13xxProtocol,
             protocol::Command,
-            thread::{BM13xxThread, ChipInitStrategy},
+            thread::{BM13xxThread, BaudControl, ChipInitStrategy},
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
@@ -54,7 +52,7 @@ use crate::{
     linux_hw::{BitBangI2c, LinuxI2c, SysfsGpio, SysfsGpioPin},
     peripheral::{apw12::Apw12, tmp1075::Tmp1075},
     tracing::prelude::*,
-    transport::serial::SerialStream,
+    transport::serial::{SerialControl, SerialStream},
 };
 
 inventory::submit! {
@@ -234,6 +232,12 @@ impl AsicEnable for SharedChainEnable {
     }
 }
 
+impl BaudControl for SerialControl {
+    fn set_baud_rate(&self, baud: u32) -> Result<()> {
+        SerialControl::set_baud_rate(self, baud).map_err(anyhow::Error::from)
+    }
+}
+
 async fn create_board() -> Result<BackplaneConnector> {
     let mut chain_gpio = SysfsGpio::new(GPIO_BASE);
 
@@ -344,7 +348,7 @@ async fn create_board() -> Result<BackplaneConnector> {
                 continue;
             }
         };
-        let (reader, writer, _control) = stream.split();
+        let (reader, writer, control) = stream.split();
         let reader = FramedRead::new(reader, bm13xx::FrameCodec);
         let writer = FramedWrite::new(writer, bm13xx::FrameCodec);
 
@@ -365,6 +369,7 @@ async fn create_board() -> Result<BackplaneConnector> {
             ChipInitStrategy::Bm1366Chain {
                 chip_count: EXPECTED_CHIPS as u8,
                 domain_config: DOMAIN_CONFIG_WRITES,
+                baud_control: Some(Box::new(control)),
             },
         );
         threads.push(Box::new(thread));

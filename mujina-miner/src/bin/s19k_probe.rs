@@ -26,8 +26,12 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use futures::sink::SinkExt;
-use mujina_miner::asic::bm13xx::{self, BM13xxProtocol, protocol::Command};
-use mujina_miner::transport::serial::SerialStream;
+use mujina_miner::asic::bm13xx::{
+    self, BM13xxProtocol,
+    protocol::{Command, Log2Difficulty, TicketMask},
+};
+use mujina_miner::transport::serial::{SerialReader, SerialStream};
+use mujina_miner::types::{HashRate, ShareRate};
 use tokio::io::AsyncReadExt;
 use tokio::time::{self, Instant};
 use tokio_util::codec::{Decoder, FramedWrite};
@@ -259,20 +263,125 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "Sending discover_chips (broadcast ChipId read) -- as the LAST step, matching the real capture..."
     );
-    let discover_cmd = BM13xxProtocol::discover_chips();
-    data_writer.send(discover_cmd).await?;
+    data_writer.send(BM13xxProtocol::discover_chips()).await?;
 
-    // Read raw bytes directly (not through FramedRead) so we can tell
-    // "chips are truly silent" apart from "chips are responding but
-    // something about framing/CRC isn't matching" -- FrameCodec's
-    // decoder silently discards one byte at a time on any mismatch,
-    // which would otherwise hide a protocol bug behind the same "0
-    // responses" result as no electrical activity at all.
+    let (chips, total_bytes) = read_responses(&mut reader, Duration::from_millis(2000)).await?;
+    report(chain, "initial discovery", &chips, total_bytes);
+
+    // HANDOFF.md's Round 7/8: real hardware testing found chips accept
+    // jobs but never return a single Nonce. A first pass sending the
+    // *whole* post-discovery config sequence then re-discovering
+    // found a real regression (77 -> 54 chips, and a flood of garbled
+    // bytes rather than silence) -- so *something* in this sequence
+    // corrupts communication. This version isolates which single step
+    // does it: send one register write, then immediately re-discover,
+    // for each step in turn, so the exact culprit shows up as the
+    // first re-discovery that regresses.
+    let asic_difficulty = Log2Difficulty::from_difficulty(
+        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
+    );
+    let steps: Vec<(&str, bm13xx::protocol::Register)> = vec![
+        (
+            "Core #1 (80 00 85 40)",
+            bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::Core,
+                &[0x80, 0x00, 0x85, 0x40],
+            ),
+        ),
+        (
+            "Core #2 (80 00 80 20)",
+            bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::Core,
+                &[0x80, 0x00, 0x80, 0x20],
+            ),
+        ),
+        (
+            "AnalogMux",
+            bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::AnalogMux,
+                &[0x00, 0x00, 0x00, 0x03],
+            ),
+        ),
+        (
+            "IoDriverStrength",
+            bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::IoDriverStrength,
+                &[0x02, 0x11, 0x41, 0x11],
+            ),
+        ),
+        (
+            "PllDivider (~50MHz, real captured value)",
+            bm13xx::protocol::Register::decode(
+                bm13xx::protocol::RegisterAddress::PllDivider,
+                &[0x40, 0xa8, 0x02, 0x65],
+            ),
+        ),
+        (
+            "TicketMask",
+            bm13xx::protocol::Register::TicketMask(TicketMask::new(asic_difficulty)),
+        ),
+        (
+            "NonceRange (BM1370's fixed unpartitioned value)",
+            bm13xx::protocol::Register::NonceRange(bm13xx::protocol::NonceRangeConfig::from_raw(
+                0xB51E_0000,
+            )),
+        ),
+    ];
+
+    let mut previous_count = chips.len();
+    for (name, register) in steps {
+        println!("\n--- Step: {name} ---");
+        data_writer
+            .send(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register,
+            })
+            .await?;
+        // Testing whether a longer settle alone (not more commands
+        // flushing the bus) is what actually clears the post-Core
+        // chatter burst found in the previous run.
+        time::sleep(Duration::from_millis(1000)).await;
+
+        data_writer.send(BM13xxProtocol::discover_chips()).await?;
+        let (step_chips, step_bytes) =
+            read_responses(&mut reader, Duration::from_millis(1000)).await?;
+        report(chain, name, &step_chips, step_bytes);
+
+        if step_chips.len() < previous_count {
+            println!(
+                "*** REGRESSION HERE: {name} dropped responsiveness from {previous_count} to {} chips. ***",
+                step_chips.len()
+            );
+        }
+        previous_count = step_chips.len();
+    }
+
+    println!(
+        "\nFinal chip count after all steps: {previous_count} (started at {}).",
+        chips.len()
+    );
+
+    println!("Disabling chain {chain} (GPIO {gpio} -> 0)...");
+    let _ = fs::write(format!("/sys/class/gpio/gpio{gpio}/value"), "0");
+
+    Ok(())
+}
+
+/// Read raw bytes directly (not through `FramedRead`) so we can tell
+/// "chips are truly silent" apart from "chips are responding but
+/// something about framing/CRC isn't matching" -- `FrameCodec`'s
+/// decoder silently discards one byte at a time on any mismatch,
+/// which would otherwise hide a protocol bug behind the same "0
+/// responses" result as no electrical activity at all.
+async fn read_responses(
+    reader: &mut SerialReader,
+    timeout: Duration,
+) -> anyhow::Result<(Vec<u8>, usize)> {
     let mut chips = Vec::new();
     let mut total_bytes = 0usize;
     let mut buf = BytesMut::new();
     let mut codec = bm13xx::FrameCodec;
-    let timeout = Duration::from_millis(2000);
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
@@ -308,12 +417,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok((chips, total_bytes))
+}
+
+fn report(chain: u8, label: &str, chips: &[u8], total_bytes: usize) {
     println!(
-        "Chain {chain}: {} chip response(s), {total_bytes} raw byte(s) received in {timeout:?}",
+        "Chain {chain} ({label}): {} chip response(s), {total_bytes} raw byte(s) received.",
         chips.len()
     );
-    if chips.len() == 77 {
-        println!("MATCHES expected 77 chips/chain.");
+    if chips.len() == EXPECTED_CHIPS {
+        println!("MATCHES expected {EXPECTED_CHIPS} chips/chain.");
     } else if total_bytes == 0 {
         println!("Zero raw bytes received -- no electrical/protocol activity at all on this UART.");
     } else {
@@ -323,9 +436,4 @@ async fn main() -> anyhow::Result<()> {
             chips.len()
         );
     }
-
-    println!("Disabling chain {chain} (GPIO {gpio} -> 0)...");
-    let _ = fs::write(format!("/sys/class/gpio/gpio{gpio}/value"), "0");
-
-    Ok(())
 }

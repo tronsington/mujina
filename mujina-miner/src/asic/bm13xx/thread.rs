@@ -180,6 +180,17 @@ impl BM13xxThread {
 /// where these values come from.
 pub type DomainConfigWrite = (u8, protocol::RegisterAddress, [u8; 4]);
 
+/// Reconfigures a chip UART's baud rate on the host side, after the
+/// chip side is told to switch via a `UartBaud` register write.
+///
+/// Deliberately transport-agnostic (this module has no dependency on
+/// `crate::transport`) -- boards that need a real baud switch during
+/// bring-up (see [`ChipInitStrategy::Bm1366Chain`]) implement this
+/// against whatever concrete serial transport they use.
+pub trait BaudControl: Send + Sync {
+    fn set_baud_rate(&self, baud: u32) -> Result<()>;
+}
+
 /// How to bring a BM13xx chip or chain up on first work assignment.
 ///
 /// Different chip families and board topologies need genuinely
@@ -200,6 +211,13 @@ pub enum ChipInitStrategy {
     Bm1366Chain {
         chip_count: u8,
         domain_config: &'static [DomainConfigWrite],
+        /// If present, switches both the chip side (`UartBaud`
+        /// register write) and the host tty to `bosminer`'s real
+        /// confirmed 3,125,000 operating baud after the rest of
+        /// bring-up completes -- see HANDOFF.md's Round 7/8 for why
+        /// this is untested-but-plausible rather than confirmed.
+        /// `None` stays at the discovery-time 115200 baud throughout.
+        baud_control: Option<Box<dyn BaudControl>>,
     },
 }
 
@@ -301,10 +319,12 @@ where
         ChipInitStrategy::Bm1366Chain {
             chip_count,
             domain_config,
+            baud_control,
         } => {
             initialize_chip_bm1366_chain(
                 *chip_count,
                 domain_config,
+                baud_control.as_deref(),
                 chip_commands,
                 peripherals,
                 asic_difficulty,
@@ -569,15 +589,14 @@ where
 /// outcome. The remaining known gaps below are the next things to
 /// investigate, not a complete list of "safe to ignore" caveats the
 /// way they might read for an otherwise-working sequence:
-/// - Stays at the discovery-time baud (115200) rather than switching
-///   to `bosminer`'s real 3,125,000 operating baud -- the real
-///   `UartBaud` register write was captured, but switching also
-///   requires reconfiguring the host tty to match, and the captured
-///   raw value doesn't cleanly match any of `BaudRate`'s known
-///   encodings, both open follow-ups (see HANDOFF.md's Next Steps).
-///   Genuinely unknown whether chips silently require this switch
-///   before accepting real job traffic even though they clearly
-///   accept ordinary register commands at 115200.
+/// - Switches to `bosminer`'s real 3,125,000 operating baud only if
+///   the caller supplies a [`BaudControl`] -- untested on real
+///   hardware as of this writing (see HANDOFF.md's Round 8). Uses
+///   the exact captured `UartBaud` wire value (`0x00003011`), not
+///   this module's `BaudRate::Baud3M`/`Baud1M` constants, which were
+///   captured from a different chip/board and don't match. With no
+///   `BaudControl` supplied, stays at the discovery-time 115200 baud
+///   throughout, matching Round 7's behavior.
 /// - Skips the per-chip addressed `InitControl`/`MiscControl`/`Core`/
 ///   `PllDivider` writes observed at specific individual chip
 ///   addresses (distinct from `domain_config`) -- these look like
@@ -593,6 +612,7 @@ where
 async fn initialize_chip_bm1366_chain<W>(
     chip_count: u8,
     domain_config: &[DomainConfigWrite],
+    baud_control: Option<&dyn BaudControl>,
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
@@ -676,28 +696,21 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    debug!("Sending broadcast core configuration");
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x85, 0x40]),
-    )
-    .await?;
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x80, 0x20]),
-    )
-    .await?;
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::AnalogMux, &[0x00, 0x00, 0x00, 0x03]),
-    )
-    .await?;
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::IoDriverStrength, &[0x02, 0x11, 0x41, 0x11]),
-    )
-    .await?;
-
+    // Deliberately NOT sending the real captured broadcast Core/
+    // AnalogMux/IoDriverStrength writes here, even though they appear
+    // at this exact point in the real wire capture. HANDOFF.md's
+    // Round 9 found the `Core` write specifically corrupts
+    // communication for an extended, non-deterministic period
+    // afterward (a bare register read shortly after it returns
+    // thousands of garbled bytes instead of a clean response,
+    // recovering only after several more commands pass -- a longer
+    // fixed delay alone made it *worse*, ruling out "just settling").
+    // Round 5/6's proven 77/77 discovery sequence never included
+    // these writes at all; only Round 7/8 added them while trying to
+    // be more complete for real hashing, which is the most likely
+    // real cause of Round 7's total nonce silence. Skipped here
+    // rather than guessing at a fix for a register write whose real
+    // requirements aren't understood at all yet.
     debug!(
         writes = domain_config.len(),
         "Sending per-chip domain config writes"
@@ -757,6 +770,38 @@ where
     .context("failed to send NonceRange")?;
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Switch to bosminer's real confirmed operating baud (3,125,000),
+    // if the board supports it -- untested hypothesis for the still-
+    // open "chips never return a Nonce" investigation (HANDOFF.md's
+    // Round 7/8). Two things have to happen in order: tell the chips
+    // via the real captured UartBaud value first (0x00003011 -- NOT
+    // this module's BaudRate::Baud3M/Baud1M constants, which were
+    // captured from a different chip/board and don't match this
+    // board's real wire bytes), *then* reconfigure the host tty to
+    // match -- reversing the order would leave the host talking at
+    // the old rate to chips already listening at the new one.
+    if let Some(baud_control) = baud_control {
+        const REAL_UART_BAUD_REGISTER_VALUE: u32 = 0x0000_3011;
+        const REAL_OPERATING_BAUD: u32 = 3_125_000;
+
+        debug!(
+            baud = REAL_OPERATING_BAUD,
+            "Switching to real operating baud"
+        );
+        send_broadcast(
+            chip_commands,
+            Register::UartBaud(protocol::BaudRate::Custom(REAL_UART_BAUD_REGISTER_VALUE)),
+        )
+        .await
+        .context("failed to send UartBaud")?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        baud_control
+            .set_baud_rate(REAL_OPERATING_BAUD)
+            .context("failed to switch host tty to real operating baud")?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     Ok(())
 }
