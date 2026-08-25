@@ -731,17 +731,31 @@ where
     // full "per-chip pass" step: SOFT_RESET_CONTROL (InitControl) and
     // MISC_CONTROL, both already sent broadcast above, get *repeated
     // addressed to each chip individually*, immediately before the
-    // CORE_MAILBOX per-chip pass (added in Round 10). Round 10 added
-    // only CORE_MAILBOX in isolation; this adds the other two using
-    // the exact same values already verified real for this board's
-    // broadcast phase (not BM1370's documented per-chip values, which
-    // add "bring-up" bits this board's real per-chip values for are
-    // unknown/uncaptured -- reusing the broadcast values addressed is
-    // the least speculative way to test whether *addressing* is what
-    // matters, without guessing new numbers). Round 10 also added the
-    // CORE_MAILBOX-only per-chip pass (core enable = 0x02/0xAA) below,
-    // documented in REFERENCE.md's "0x3C - CORE_MAILBOX" section as
-    // the step that actually turns cores on.
+    // CORE_MAILBOX per-chip pass. Round 10 sent this addressed but
+    // reused the broadcast-phase data verbatim, since this board's
+    // real per-chip values were unknown/uncaptured at the time --
+    // that round shipped and tested clean, but still produced zero
+    // Nonce responses.
+    //
+    // Round 12 went back to the original bosminer wire capture
+    // (/tmp/trace.log on the miner, captured in Round 4 via
+    // s19k-trace) and searched it specifically for *addressed*
+    // (non-broadcast) InitControl/MiscControl/Core writes -- a query
+    // never run before, because every earlier pass through that trace
+    // only pulled out the broadcast-phase values. It turns out the
+    // real per-chip values genuinely differ from the broadcast ones
+    // (matching REFERENCE.md's description of the per-chip pass
+    // adding extra "bring-up" bits on top of the broadcast values),
+    // and the real Core triplet order is different from what Round 10
+    // guessed. Confirmed identical across all 77 chip addresses
+    // (0x00..=0x98) on ttyS1 -- these are fixed values applied to
+    // every chip, not per-address-varying data:
+    //   InitControl addressed: 00 07 01 f0  (broadcast was 00 07 00 00)
+    //   MiscControl  addressed: f0 00 c1 00  (broadcast was ff 0f c1 00)
+    //   Core triplet, in this exact real order:
+    //     1. 80 00 80 20  (reg 0x00 clock delay = 0x20)
+    //     2. 80 00 82 aa  (reg 0x02 core enable  = 0xAA)
+    //     3. 80 00 85 40  (reg 0x05 clock select = 0x40)
     debug!(
         chip_count,
         "Sending per-chip InitControl/MiscControl/CORE_MAILBOX pass"
@@ -752,7 +766,7 @@ where
             .send(Command::WriteRegister {
                 broadcast: false,
                 chip_address,
-                register: Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x00, 0x00]),
+                register: Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x01, 0xf0]),
             })
             .await
             .map_err(|e| anyhow!("{e:?}"))
@@ -762,16 +776,16 @@ where
             .send(Command::WriteRegister {
                 broadcast: false,
                 chip_address,
-                register: Register::decode(RegisterAddress::MiscControl, &[0xff, 0x0f, 0xc1, 0x00]),
+                register: Register::decode(RegisterAddress::MiscControl, &[0xf0, 0x00, 0xc1, 0x00]),
             })
             .await
             .map_err(|e| anyhow!("{e:?}"))
             .context("failed to send per-chip MiscControl")?;
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         for data in [
-            [0x80u8, 0x00, 0x85, 0x40], // reg 0x05 clock select = 0x40
-            [0x80, 0x00, 0x80, 0x20],   // reg 0x00 clock delay = 0x20
+            [0x80u8, 0x00, 0x80, 0x20], // reg 0x00 clock delay = 0x20
             [0x80, 0x00, 0x82, 0xaa],   // reg 0x02 core enable = 0xAA
+            [0x80, 0x00, 0x85, 0x40],   // reg 0x05 clock select = 0x40
         ] {
             chip_commands
                 .send(Command::WriteRegister {
