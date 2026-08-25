@@ -9,10 +9,12 @@
 //! support, so this is the software equivalent: launch bosminer
 //! directly under ptrace (like `strace <command>`), and at every
 //! syscall log its number and first three register arguments. `open`
-//! /`openat` calls populate an fd -> path map (by reading the path
-//! string from the tracee's own memory via `/proc/<pid>/mem`);
-//! `write` calls with a known fd get their buffer hex-dumped the same
-//! way.
+//! /`openat` calls populate an fd -> path map (re-derived from
+//! `/proc/<pid>/fd` right after the matching *exit*-stop, once the fd
+//! actually exists -- refreshing at entry raced real interleaving
+//! from other threads); `write` calls with a known fd get their
+//! buffer hex-dumped by reading the tracee's own memory via
+//! `/proc/<pid>/mem`.
 //!
 //! `libc::ptrace` is C-variadic, and Rust FFI requires exact argument
 //! types at variadic call sites (no automatic promotion the way a C
@@ -40,7 +42,7 @@
 //! tracer since there's no detach path implemented (not needed here
 //! -- always followed by a clean `/etc/init.d/S99bosminer restart`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -188,6 +190,10 @@ fn parent_trace(main_pid: pid_t) {
     // Per-thread enter/exit toggle -- each traced tid alternates
     // independently, interleaved with every other tid's stops.
     let mut entering: HashMap<pid_t, bool> = HashMap::from([(main_pid, true)]);
+    // Tids whose most recent entry-stop was open/openat, awaiting
+    // the matching exit-stop to refresh fd_paths (see
+    // log_syscall_entry's docs for why not at entry).
+    let mut pending_open: HashSet<pid_t> = HashSet::new();
     let start = Instant::now();
     let mut last_summary = start;
 
@@ -278,15 +284,23 @@ fn parent_trace(main_pid: pid_t) {
         }
 
         let was_entering = *entering.entry(stopped_pid).or_insert(true);
-        if was_entering && let Some(regs) = get_regs(stopped_pid) {
-            log_syscall_entry(
-                &mut mem,
-                stopped_pid,
-                &regs,
-                &mut fd_paths,
-                &mut other_syscalls,
-                start.elapsed(),
-            );
+        if was_entering {
+            if let Some(regs) = get_regs(stopped_pid) {
+                let is_open = log_syscall_entry(
+                    &mut mem,
+                    &regs,
+                    &fd_paths,
+                    &mut other_syscalls,
+                    start.elapsed(),
+                );
+                if is_open {
+                    pending_open.insert(stopped_pid);
+                }
+            }
+        } else if pending_open.remove(&stopped_pid) {
+            // The open/openat this tid entered has now completed;
+            // its fd (if any) exists and is safe to resolve.
+            refresh_fd_paths(main_pid, &mut fd_paths);
         }
         entering.insert(stopped_pid, !was_entering);
 
@@ -320,14 +334,19 @@ fn get_regs(pid: pid_t) -> Option<ArmRegs> {
     if rc < 0 { None } else { Some(regs) }
 }
 
+/// Logs one syscall entry; returns `true` for `open`/`openat` so the
+/// caller can refresh the fd -> path map on the *matching exit*, not
+/// here. The fd isn't allocated until the syscall actually completes
+/// -- refreshing at entry raced real open/close/write interleaving
+/// from other threads, sometimes attributing a write to a stale,
+/// reused fd number from an entirely different, already-closed file.
 fn log_syscall_entry(
     mem: &mut File,
-    pid: pid_t,
     regs: &ArmRegs,
-    fd_paths: &mut HashMap<u32, String>,
+    fd_paths: &HashMap<u32, String>,
     other_syscalls: &mut HashMap<u32, OtherSyscallStats>,
     elapsed: Duration,
-) {
+) -> bool {
     let nr = regs.syscall_nr();
     let (a0, a1, a2) = (regs.arg(0), regs.arg(1), regs.arg(2));
 
@@ -335,15 +354,12 @@ fn log_syscall_entry(
         SYS_OPEN => {
             let path = read_cstr(mem, a0);
             println!("[{:>8.3}] open({path:?})", elapsed.as_secs_f64());
-            // The real fd isn't known until the matching exit-stop;
-            // re-deriving the whole map from /proc/<pid>/fd right
-            // after is simpler and correct regardless of timing.
-            refresh_fd_paths(pid, fd_paths);
+            return true;
         }
         SYS_OPENAT => {
             let path = read_cstr(mem, a1);
             println!("[{:>8.3}] openat(.., {path:?})", elapsed.as_secs_f64());
-            refresh_fd_paths(pid, fd_paths);
+            return true;
         }
         SYS_WRITE => {
             let path = fd_paths
@@ -374,6 +390,7 @@ fn log_syscall_entry(
             stats.last_a2 = a2;
         }
     }
+    false
 }
 
 /// Tally for a syscall number not specifically decoded above.
