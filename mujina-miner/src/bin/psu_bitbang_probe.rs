@@ -32,14 +32,14 @@
 //!   disable-watchdog        disable the PSU's comms watchdog
 //!   output-on               enable PSU output (PSU_nEN / gpio437 low)
 //!   output-off              disable PSU output (PSU_nEN / gpio437 high)
+//!   set-voltage <volts>     set the DAC setpoint, verified by readback
 //!   scan-addr <addr-hex>    just check ACK at a given address (no data)
 //!
 //! `output-on`/`output-off` only ever toggle the existing DAC
-//! setpoint on or off -- they never change what voltage is
-//! configured. Voltage-changing commands (set-voltage, set-dac,
-//! enable-watchdog) are implemented in the protocol layer but
-//! deliberately not wired up to the CLI -- until there's a specific,
-//! deliberate reason to change the PSU's configured output voltage.
+//! setpoint on or off -- they don't change what voltage is
+//! configured; use `set-voltage` for that. `set-dac`/`enable-watchdog`
+//! are implemented in the protocol layer but deliberately not wired
+//! up to the CLI -- no need for them yet.
 
 use std::fmt;
 use std::fs;
@@ -79,10 +79,6 @@ const CMD_READ_STATE: u8 = 0x05;
 )]
 const CMD_READ_CAL: u8 = 0x06;
 const CMD_WATCHDOG: u8 = 0x81;
-#[expect(
-    dead_code,
-    reason = "state-changing command, deliberately not wired to the CLI yet"
-)]
 const CMD_SET_VOLTAGE: u8 = 0x83;
 #[expect(
     dead_code,
@@ -213,6 +209,11 @@ fn parse_frame(raw: &[u8]) -> Result<Frame, ProtocolError> {
 
 fn decode_dac_to_voltage(dac: u8) -> f32 {
     DAC_REF_VOLTS + DAC_OFFSET_VOLTS_PER_COUNT * f32::from(dac)
+}
+
+fn encode_voltage_to_dac(voltage: f32) -> u8 {
+    let code = ((voltage - DAC_REF_VOLTS) / DAC_OFFSET_VOLTS_PER_COUNT).round();
+    code.clamp(0.0, 255.0) as u8
 }
 
 fn decode_measured_voltage(adc_lo: u8, adc_hi: u8) -> f32 {
@@ -574,6 +575,36 @@ fn run(args: &[String]) -> Result<(), ProtocolError> {
             println!("watchdog disabled");
             println!("raw: {:02X?}", frame.raw);
         }
+        "set-voltage" => {
+            let volts: f32 = args
+                .get(1)
+                .expect("usage: psu-bitbang-probe set-voltage <volts>")
+                .parse()
+                .expect("bad voltage");
+            let dac = encode_voltage_to_dac(volts);
+            let frame = psu.exchange(CMD_SET_VOLTAGE, &[dac, 0x00])?;
+            println!(
+                "requested {volts:.4} V -> dac=0x{dac:02X} ({dac}) -> nearest encodable={:.4} V",
+                decode_dac_to_voltage(dac)
+            );
+            println!("raw: {:02X?}", frame.raw);
+            // Verify by reading the setpoint back rather than trusting
+            // the write echoed correctly.
+            let readback = psu.exchange(CMD_GET_VOLTAGE, &[])?;
+            let readback_dac = *readback
+                .payload
+                .first()
+                .ok_or(ProtocolError::EmptyResponse)?;
+            println!(
+                "readback: dac=0x{readback_dac:02X} ({readback_dac}) -> {:.4} V{}",
+                decode_dac_to_voltage(readback_dac),
+                if readback_dac == dac {
+                    " (matches)"
+                } else {
+                    " (MISMATCH)"
+                }
+            );
+        }
         other => {
             eprintln!("unknown command: {other}");
             print_help();
@@ -600,4 +631,5 @@ fn print_help() {
     println!("  measure-voltage");
     println!("  read-state");
     println!("  disable-watchdog");
+    println!("  set-voltage <volts>    set the DAC setpoint, verified by readback");
 }
