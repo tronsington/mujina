@@ -727,6 +727,41 @@ where
     )
     .await?;
 
+    // The broadcast CORE_MAILBOX writes above configure clock delay/
+    // select for every core, but per REFERENCE.md's "0x3C -
+    // CORE_MAILBOX" section, the real bring-up sequence repeats those
+    // same two writes addressed to *each chip individually*, with a
+    // third write appended that this driver has never sent at all:
+    // "0x02 core enable: 0xAA on every model, per-chip pass only".
+    // Without it the cores plausibly never actually turn on, which
+    // would fully explain Round 7-9's total nonce silence regardless
+    // of everything else being correct. New as of Round 10 -- not yet
+    // confirmed to fix anything, but a real documented gap, not a
+    // guess.
+    debug!(
+        chip_count,
+        "Sending per-chip CORE_MAILBOX pass (incl. core enable)"
+    );
+    for i in 0..chip_count as u16 {
+        let chip_address = (i * 2) as u8;
+        for data in [
+            [0x80u8, 0x00, 0x85, 0x40], // reg 0x05 clock select = 0x40
+            [0x80, 0x00, 0x80, 0x20],   // reg 0x00 clock delay = 0x20
+            [0x80, 0x00, 0x82, 0xaa],   // reg 0x02 core enable = 0xAA
+        ] {
+            chip_commands
+                .send(Command::WriteRegister {
+                    broadcast: false,
+                    chip_address,
+                    register: Register::decode(RegisterAddress::Core, &data),
+                })
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .context("failed to send per-chip CORE_MAILBOX write")?;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
     debug!(
         writes = domain_config.len(),
         "Sending per-chip domain config writes"
