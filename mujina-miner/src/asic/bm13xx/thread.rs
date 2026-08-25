@@ -696,21 +696,37 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    // Deliberately NOT sending the real captured broadcast Core/
-    // AnalogMux/IoDriverStrength writes here, even though they appear
-    // at this exact point in the real wire capture. HANDOFF.md's
-    // Round 9 found the `Core` write specifically corrupts
-    // communication for an extended, non-deterministic period
-    // afterward (a bare register read shortly after it returns
-    // thousands of garbled bytes instead of a clean response,
-    // recovering only after several more commands pass -- a longer
-    // fixed delay alone made it *worse*, ruling out "just settling").
-    // Round 5/6's proven 77/77 discovery sequence never included
-    // these writes at all; only Round 7/8 added them while trying to
-    // be more complete for real hashing, which is the most likely
-    // real cause of Round 7's total nonce silence. Skipped here
-    // rather than guessing at a fix for a register write whose real
-    // requirements aren't understood at all yet.
+    // Round 9 found *why* Core corrupted communication (Rounds 7/8):
+    // Register::decode always used little-endian, but Core's wire
+    // encoding is big-endian (see protocol.rs's decode fix) -- so
+    // every Core write sent so far was a malformed CORE_MAILBOX
+    // command (see REFERENCE.md's "0x3C - CORE_MAILBOX"), not the
+    // real captured one. Decoding the real captured bytes
+    // big-endian instead matches REFERENCE.md's documented bring-up
+    // values exactly (reg 0x05=0x40 "clock select", reg 0x00=0x20
+    // "clock delay" for BM1366). Restored now that decode is fixed.
+    debug!("Sending broadcast core configuration (CORE_MAILBOX, now correctly big-endian)");
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x85, 0x40]),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x80, 0x20]),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::AnalogMux, &[0x00, 0x00, 0x00, 0x03]),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::IoDriverStrength, &[0x02, 0x11, 0x41, 0x11]),
+    )
+    .await?;
+
     debug!(
         writes = domain_config.len(),
         "Sending per-chip domain config writes"
