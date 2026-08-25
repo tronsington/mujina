@@ -74,6 +74,10 @@ path = "src/bin/s19k_probe.rs"
 name = "psu-bitbang-probe"
 path = "src/bin/psu_bitbang_probe.rs"
 
+[[bin]]
+name = "s19k-trace"
+path = "src/bin/s19k_trace.rs"
+
 [features]
 default = []
 skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
