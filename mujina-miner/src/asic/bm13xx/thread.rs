@@ -727,23 +727,47 @@ where
     )
     .await?;
 
-    // The broadcast CORE_MAILBOX writes above configure clock delay/
-    // select for every core, but per REFERENCE.md's "0x3C -
-    // CORE_MAILBOX" section, the real bring-up sequence repeats those
-    // same two writes addressed to *each chip individually*, with a
-    // third write appended that this driver has never sent at all:
-    // "0x02 core enable: 0xAA on every model, per-chip pass only".
-    // Without it the cores plausibly never actually turn on, which
-    // would fully explain Round 7-9's total nonce silence regardless
-    // of everything else being correct. New as of Round 10 -- not yet
-    // confirmed to fix anything, but a real documented gap, not a
-    // guess.
+    // REFERENCE.md's documented bring-up (BM1370 walkthrough) has a
+    // full "per-chip pass" step: SOFT_RESET_CONTROL (InitControl) and
+    // MISC_CONTROL, both already sent broadcast above, get *repeated
+    // addressed to each chip individually*, immediately before the
+    // CORE_MAILBOX per-chip pass (added in Round 10). Round 10 added
+    // only CORE_MAILBOX in isolation; this adds the other two using
+    // the exact same values already verified real for this board's
+    // broadcast phase (not BM1370's documented per-chip values, which
+    // add "bring-up" bits this board's real per-chip values for are
+    // unknown/uncaptured -- reusing the broadcast values addressed is
+    // the least speculative way to test whether *addressing* is what
+    // matters, without guessing new numbers). Round 10 also added the
+    // CORE_MAILBOX-only per-chip pass (core enable = 0x02/0xAA) below,
+    // documented in REFERENCE.md's "0x3C - CORE_MAILBOX" section as
+    // the step that actually turns cores on.
     debug!(
         chip_count,
-        "Sending per-chip CORE_MAILBOX pass (incl. core enable)"
+        "Sending per-chip InitControl/MiscControl/CORE_MAILBOX pass"
     );
     for i in 0..chip_count as u16 {
         let chip_address = (i * 2) as u8;
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: false,
+                chip_address,
+                register: Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x00, 0x00]),
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send per-chip InitControl")?;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: false,
+                chip_address,
+                register: Register::decode(RegisterAddress::MiscControl, &[0xff, 0x0f, 0xc1, 0x00]),
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send per-chip MiscControl")?;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         for data in [
             [0x80u8, 0x00, 0x85, 0x40], // reg 0x05 clock select = 0x40
             [0x80, 0x00, 0x80, 0x20],   // reg 0x00 clock delay = 0x20
