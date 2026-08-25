@@ -98,25 +98,27 @@ async fn main() -> anyhow::Result<()> {
     let (mut reader, writer, _control) = stream.split();
     let mut data_writer = FramedWrite::new(writer, bm13xx::FrameCodec);
 
-    println!("Sending ChainInactive...");
-    data_writer.send(Command::ChainInactive).await?;
+    // Real captured BM1362 firmware traffic (S19j Pro; see
+    // REFERENCE.md's "Multi-Chip Initialization" section and its
+    // [^chaininit] footnote) sends ONE VersionMask write, THEN
+    // discovery -- ChainInactive doesn't come until later, as part
+    // of the addressing/SetChipAddress step, not as a discovery
+    // prerequisite. Earlier attempts sent ChainInactive first and
+    // three VersionMask writes before discovery, copying bitaxe.rs's
+    // BM1370/S21-Pro-style pattern instead of the BM1362-specific
+    // captured sequence. Match the real capture here.
+    println!("Sending VersionMask (broadcast, x1, matching the real captured BM1362 sequence)...");
+    let version_mask_cmd = Command::WriteRegister {
+        broadcast: true,
+        chip_address: 0x00,
+        register: bm13xx::protocol::Register::VersionMask(
+            bm13xx::protocol::VersionMask::full_rolling(),
+        ),
+    };
+    data_writer.send(version_mask_cmd).await?;
     time::sleep(Duration::from_millis(10)).await;
 
-    println!("Sending VersionMask (broadcast, x3)...");
-    for _ in 1..=3 {
-        let cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
-        data_writer.send(cmd).await?;
-        time::sleep(Duration::from_millis(5)).await;
-    }
-    time::sleep(Duration::from_millis(10)).await;
-
-    println!("Sending discover_chips (broadcast ChipId read)...");
+    println!("Sending discover_chips (broadcast ChipId read) -- no ChainInactive first...");
     let discover_cmd = BM13xxProtocol::discover_chips();
     data_writer.send(discover_cmd).await?;
 
