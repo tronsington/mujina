@@ -23,7 +23,11 @@ use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
-        bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
+        bm13xx::{
+            self, BM13xxProtocol,
+            protocol::Command,
+            thread::{BM13xxThread, ChipInitStrategy},
+        },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
@@ -182,6 +186,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         data_writer,
         peripherals,
         thread_shutdown_rx,
+        ChipInitStrategy::Bm1370Single,
     );
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 

@@ -10,26 +10,29 @@
 //! Full hardware map, GPIO/I2C addresses, and how each was confirmed:
 //! `s19k-pro-am3-hardware-notes.md` in the recon docs.
 //!
-//! **Chip discovery works** (see `HANDOFF.md`'s "Round 5") -- the
-//! chips actually self-report as BM1366, not BM1362 as assumed
-//! earlier in the investigation. This driver powers the PSU, resets
-//! all three chains together (a real hardware requirement found in
-//! Round 5: a single chain enabled alone never responds, even at
-//! correct voltage), and runs the corrected per-chain bring-up
-//! sequence, logging the discovered chip count per chain. **Hash
-//! threads are not wired up yet** -- that needs a real BM1366
-//! register-init/frequency-tuning sequence (untested beyond
-//! discovery) and `BM13xxThread` integration, both still open (see
-//! HANDOFF.md's Next Steps). This driver still returns no hash
-//! threads, but for a new reason: not because chips are unreachable,
-//! but because there's no verified mining-ready register sequence for
-//! them yet.
+//! **Chip discovery works and hash threads are wired up** (see
+//! `HANDOFF.md`'s "Round 5"/"Round 6"/"Round 7") -- the chips actually
+//! self-report as BM1366, not BM1362 as assumed earlier in the
+//! investigation. This driver powers the PSU, resets all three chains
+//! together (a real hardware requirement found in Round 5: a single
+//! chain enabled alone never responds, even at correct voltage), and
+//! creates one `BM13xxThread` per chain using a chain-shaped
+//! `ChipInitStrategy::Bm1366Chain` (see `asic/bm13xx/thread.rs`) that
+//! replays the real captured bring-up sequence. **Not yet a tuned,
+//! full-speed miner** -- see that strategy's doc comment for the
+//! specific known gaps (fixed conservative ~50MHz frequency rather
+//! than a verified ramp to nameplate, discovery-time baud rather than
+//! `bosminer`'s real 3.125Mbaud operating speed, per-chip calibration
+//! writes not replicated). Real, working, and safely conservative
+//! rather than fast.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use futures::sink::SinkExt;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -40,7 +43,12 @@ use crate::{
     api_client::types::{BoardTelemetry, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
-        bm13xx::{self, BM13xxProtocol, protocol::Command},
+        bm13xx::{
+            self, BM13xxProtocol,
+            protocol::Command,
+            thread::{BM13xxThread, ChipInitStrategy},
+        },
+        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue},
     linux_hw::{BitBangI2c, LinuxI2c, SysfsGpio, SysfsGpioPin},
@@ -160,19 +168,88 @@ pub(crate) const DOMAIN_CONFIG_WRITES: &[(u8, bm13xx::protocol::RegisterAddress,
     ]
 };
 
+/// Chain-enable/reset GPIO state shared across all three chains' hash
+/// threads (and the board's own early discovery validation below).
+///
+/// `enable()` is idempotent by design. Round 5 found all three chains
+/// must be reset *together*, but each chain's `BM13xxThread` lazily
+/// calls `enable()` independently, whenever the scheduler gets around
+/// to that chain's first work assignment -- without idempotency, a
+/// later chain's first job would re-pulse reset on all three lines
+/// and wipe out an already-addressed, already-hashing earlier chain.
+struct SharedChainState {
+    pins: [SysfsGpioPin; 3],
+    enabled: bool,
+}
+
+impl SharedChainState {
+    /// Release all three chains back to disabled/reset, for shutdown.
+    async fn disable_all(&mut self) {
+        for pin in &mut self.pins {
+            let _ = pin.write(PinValue::Low).await;
+        }
+        self.enabled = false;
+    }
+}
+
+type SharedChainStateHandle = Arc<Mutex<SharedChainState>>;
+
+/// Per-chain [`AsicEnable`] handle sharing one physical reset state
+/// across all three chains -- see [`SharedChainState`].
+#[derive(Clone)]
+struct SharedChainEnable {
+    state: SharedChainStateHandle,
+    /// Which of the three chains this specific handle belongs to.
+    /// Only used by `disable()`, which releases just this chain's own
+    /// line -- `enable()` always affects all three together.
+    my_index: usize,
+}
+
+#[async_trait]
+impl AsicEnable for SharedChainEnable {
+    async fn enable(&mut self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.enabled {
+            return Ok(());
+        }
+        for pin in &mut state.pins {
+            pin.write(PinValue::Low).await?;
+        }
+        time::sleep(Duration::from_millis(200)).await;
+        for pin in &mut state.pins {
+            pin.write(PinValue::High).await?;
+        }
+        // bosminer's own log shows ~2s between "Resetting hash board"
+        // and "Initializing hashchain" (its first UART command);
+        // matching that gap here in case chips need real settle time.
+        time::sleep(Duration::from_millis(2000)).await;
+        state.enabled = true;
+        Ok(())
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.pins[self.my_index].write(PinValue::Low).await?;
+        Ok(())
+    }
+}
+
 async fn create_board() -> Result<BackplaneConnector> {
     let mut chain_gpio = SysfsGpio::new(GPIO_BASE);
 
-    // Hold all three chains in reset while power comes up, matching
-    // bitaxe.rs's "hold ASIC in reset during power configuration"
-    // pattern.
-    let mut enable_pins = Vec::with_capacity(CHAIN_ENABLE_OFFSETS.len());
+    let mut pins = Vec::with_capacity(CHAIN_ENABLE_OFFSETS.len());
     for &offset in &CHAIN_ENABLE_OFFSETS {
         let mut pin = chain_gpio.pin(offset).await.context("chain enable pin")?;
         pin.set_mode(PinMode::Output).await?;
         pin.write(PinValue::Low).await?;
-        enable_pins.push(pin);
+        pins.push(pin);
     }
+    let chain_state: SharedChainStateHandle = Arc::new(Mutex::new(SharedChainState {
+        pins: pins
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("exactly CHAIN_ENABLE_OFFSETS.len() pins pushed")),
+        enabled: false,
+    }));
 
     let mut presence = [false; CHAIN_PRESENCE_OFFSETS.len()];
     for (chain, &offset) in CHAIN_PRESENCE_OFFSETS.iter().enumerate() {
@@ -202,13 +279,15 @@ async fn create_board() -> Result<BackplaneConnector> {
         })
         .collect::<Result<_>>()?;
 
-    // Power up and discover chips. Deliberately non-fatal: a failure
-    // here (PSU I2C glitch, one chain not responding, etc.) shouldn't
-    // take down temperature/PSU telemetry, which are independently
-    // useful. Real hash threads aren't created either way yet (see
-    // module docs), so there's nothing downstream that actually
-    // depends on this succeeding today.
-    match bring_up_chains(&mut psu, &mut psu_nen_pin, &mut enable_pins).await {
+    // Power up and validate discovery early, for immediate visibility
+    // in the logs regardless of when (or whether) the scheduler gets
+    // around to actually assigning each chain's hash thread its first
+    // job -- that's a separate, later re-run of essentially the same
+    // sequence (see ChipInitStrategy::Bm1366Chain), not a dependency:
+    // failure here is deliberately non-fatal, since temperature/PSU
+    // telemetry and the hash threads created below are independently
+    // useful even if this early check has a bad run.
+    match power_up_and_validate(&mut psu, &mut psu_nen_pin, &chain_state).await {
         Ok(chip_counts) => {
             for (chain, count) in chip_counts.iter().enumerate() {
                 if *count == EXPECTED_CHIPS {
@@ -224,7 +303,7 @@ async fn create_board() -> Result<BackplaneConnector> {
             }
         }
         Err(e) => {
-            warn!(error = ?e, "Chain bring-up/discovery failed");
+            warn!(error = ?e, "Chain power-up/discovery failed");
         }
     }
 
@@ -248,9 +327,54 @@ async fn create_board() -> Result<BackplaneConnector> {
     let cancel = CancellationToken::new();
     let monitor_task = spawn_monitor(temp_sensors, psu, telemetry_tx, cancel.clone());
 
+    // One BM13xxThread per chain, each with its own real serial
+    // connection but sharing the same idempotent chain-enable/reset
+    // state -- see SharedChainEnable. A chain whose UART fails to
+    // open is skipped (logged), not fatal to the other chains.
+    let (thread_shutdown_tx, _initial_removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+    let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
+    for (chain, &tty) in CHAIN_TTYS.iter().enumerate() {
+        let stream = match SerialStream::new(tty, CHAIN_BAUD) {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!(
+                    chain = chain + 1,
+                    tty, error = %e, "Failed to open chain UART for hash thread; skipping"
+                );
+                continue;
+            }
+        };
+        let (reader, writer, _control) = stream.split();
+        let reader = FramedRead::new(reader, bm13xx::FrameCodec);
+        let writer = FramedWrite::new(writer, bm13xx::FrameCodec);
+
+        let peripherals = BoardPeripherals {
+            asic_enable: Some(Box::new(SharedChainEnable {
+                state: chain_state.clone(),
+                my_index: chain,
+            })),
+            voltage_regulator: None,
+        };
+
+        let thread = BM13xxThread::new(
+            format!("Antminer-S19K-AM3-chain{}", chain + 1),
+            reader,
+            writer,
+            peripherals,
+            thread_shutdown_tx.subscribe(),
+            ChipInitStrategy::Bm1366Chain {
+                chip_count: EXPECTED_CHIPS as u8,
+                domain_config: DOMAIN_CONFIG_WRITES,
+            },
+        );
+        threads.push(Box::new(thread));
+    }
+    info!(threads = threads.len(), "Hash threads created");
+
     let mut board = AntminerS19kAm3 {
-        enable_pins,
+        chain_state,
         psu_nen_pin,
+        thread_shutdown: thread_shutdown_tx,
         monitor_cancel: cancel,
         monitor_task,
     };
@@ -259,30 +383,25 @@ async fn create_board() -> Result<BackplaneConnector> {
         board.shutdown().await;
     });
 
-    warn!(
-        "BM1366 register-init/frequency-tuning sequence not yet solved for this board \
-         (chip discovery works -- see HANDOFF.md's Round 5) -- registering with no hash threads"
-    );
-
     Ok(BackplaneConnector {
         info,
-        threads: Vec::new(),
+        threads,
         telemetry_rx,
         shutdown: Some(shutdown),
     })
 }
 
-/// Power the hashboards and discover chips on all three chains.
+/// Power the hashboards and validate discovery on all three chains.
 ///
 /// Returns the discovered chip count per chain (index-matched to
 /// `CHAIN_TTYS`/`CHAIN_ENABLE_OFFSETS`) on success. A chain returning
 /// fewer than `EXPECTED_CHIPS` isn't itself an error here -- the
 /// caller decides how to log/react; this function's job is just to
 /// run the real bring-up and report what happened.
-async fn bring_up_chains(
+async fn power_up_and_validate(
     psu: &mut Apw12<BitBangI2c>,
     psu_nen_pin: &mut SysfsGpioPin,
-    enable_pins: &mut [SysfsGpioPin],
+    chain_state: &SharedChainStateHandle,
 ) -> Result<[usize; 3]> {
     psu.disable_watchdog()
         .await
@@ -296,21 +415,17 @@ async fn bring_up_chains(
 
     ramp_psu_voltage(psu, PSU_TARGET_VOLTS).await?;
 
-    // Reset all three chains *together* -- a real hardware
-    // requirement found the hard way (HANDOFF.md's "Round 5"): a
-    // single chain enabled alone, even at confirmed correct voltage,
-    // never responds to anything. All three enabled together does.
-    for pin in enable_pins.iter_mut() {
-        pin.write(PinValue::Low).await?;
+    // Same idempotent reset any hash thread's own lazy init would
+    // trigger (see SharedChainEnable) -- whichever runs first, this
+    // or a thread's first job, does the real work; the other becomes
+    // a no-op.
+    SharedChainEnable {
+        state: chain_state.clone(),
+        my_index: 0,
     }
-    time::sleep(Duration::from_millis(200)).await;
-    for pin in enable_pins.iter_mut() {
-        pin.write(PinValue::High).await?;
-    }
-    // bosminer's own log shows ~2s between "Resetting hash board" and
-    // "Initializing hashchain" (its first UART command); matching
-    // that gap here in case chips need real settle time after reset.
-    time::sleep(Duration::from_millis(2000)).await;
+    .enable()
+    .await
+    .context("resetting/enabling chains")?;
 
     let mut chip_counts = [0usize; 3];
     for (chain, tty) in CHAIN_TTYS.iter().enumerate() {
@@ -553,19 +668,27 @@ fn spawn_monitor(
 
 /// Antminer S19K Pro board state, held for the board's lifetime.
 struct AntminerS19kAm3 {
-    enable_pins: Vec<SysfsGpioPin>,
+    chain_state: SharedChainStateHandle,
     psu_nen_pin: SysfsGpioPin,
+    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
     monitor_cancel: CancellationToken,
     monitor_task: tokio::task::JoinHandle<()>,
 }
 
 impl AntminerS19kAm3 {
     async fn shutdown(&mut self) {
+        // Signal hash threads first and give them a moment to react
+        // (matching bitaxe.rs's shutdown pattern) before pulling power
+        // out from under them.
+        if let Err(e) = self.thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
+            warn!(error = %e, "Failed to send shutdown signal to hash threads");
+        } else {
+            time::sleep(Duration::from_millis(200)).await;
+        }
+
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
-        for pin in &mut self.enable_pins {
-            let _ = pin.write(PinValue::Low).await;
-        }
+        self.chain_state.lock().await.disable_all().await;
         let _ = self.psu_nen_pin.write(PinValue::High).await; // disable PSU output
     }
 }
