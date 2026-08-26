@@ -97,9 +97,20 @@ const PSU_NEN_OFFSET: u8 = 26;
 const PSU_SCL_GPIO: u32 = 476;
 const PSU_SDA_GPIO: u32 = 477;
 
-/// Real target output voltage, confirmed from `bosminer`'s own PSU
-/// ramp log (HANDOFF.md's "Round 3").
-const PSU_TARGET_VOLTS: f32 = 15.2;
+/// Real target output voltage. `bosminer`'s own PSU ramp log (Round
+/// 3) confirmed 15.2V as its initial *bring-up* ceiling, but Round
+/// 14's investigation found that's not the real sustained-operation
+/// target: a community fork (github.com/Schnitzel/mujina,
+/// amlogic-s19kpro-support branch) documents Braiins' own bosminer
+/// reporting this exact hashboard model's (BHB56902) factory ATE
+/// setpoint directly (`Detected hashboard #2: Voltage (Avg.) 13.90 V,
+/// Frequency (Avg.) 645 MHz`), and their own real hardware testing
+/// confirms real sustained hashing at that voltage. Every Round 14
+/// test that failed above 300MHz ran the entire time at the 15.2V
+/// bring-up ceiling, never adjusted down -- this may have been
+/// silently starving or destabilizing the PLL, independent of the
+/// PLL divider math itself.
+const PSU_TARGET_VOLTS: f32 = 13.9;
 const PSU_RAMP_STEP_VOLTS: f32 = 0.5;
 const PSU_RAMP_STEP_DELAY: Duration = Duration::from_millis(1500);
 
@@ -442,10 +453,18 @@ async fn power_up_and_validate(
     Ok(chip_counts)
 }
 
-/// Gradually raise PSU output voltage to `target`, matching
-/// `bosminer`'s own observed ramp behavior (HANDOFF.md's "Round 3")
-/// rather than jumping straight to a high setpoint on a rail that may
-/// not have been driven in a while.
+/// Gradually move PSU output voltage to `target`, stepping in either
+/// direction, matching `bosminer`'s own observed ramp behavior
+/// (HANDOFF.md's "Round 3" and "Round 14") rather than jumping
+/// straight to a setpoint on a rail that may not have been driven in
+/// a while.
+///
+/// Round 14 watched a real `bosminer` cold-start tune session move
+/// voltage both up *and* down repeatedly during its fine-tuning
+/// search (15.2V initial ceiling, then down through ~12.2V, then
+/// back up) -- this only ever ramped up, which would have silently
+/// no-op'd (left voltage wherever it already was) on any target below
+/// the current setpoint.
 async fn ramp_psu_voltage(psu: &mut Apw12<BitBangI2c>, target: f32) -> Result<()> {
     let mut current = psu
         .get_voltage()
@@ -453,8 +472,12 @@ async fn ramp_psu_voltage(psu: &mut Apw12<BitBangI2c>, target: f32) -> Result<()
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("reading PSU voltage setpoint")?;
 
-    while current < target {
-        current = (current + PSU_RAMP_STEP_VOLTS).min(target);
+    while current != target {
+        current = if current < target {
+            (current + PSU_RAMP_STEP_VOLTS).min(target)
+        } else {
+            (current - PSU_RAMP_STEP_VOLTS).max(target)
+        };
         set_voltage_with_retries(psu, current).await?;
         time::sleep(PSU_RAMP_STEP_DELAY).await;
     }
