@@ -1,0 +1,363 @@
+diff --git a/mujina-miner/src/asic/bm13xx/chip_config.rs b/mujina-miner/src/asic/bm13xx/chip_config.rs
+index 4fbaead..92600c6 100644
+--- a/mujina-miner/src/asic/bm13xx/chip_config.rs
++++ b/mujina-miner/src/asic/bm13xx/chip_config.rs
+@@ -358,7 +358,17 @@ pub fn bm1366() -> ChipConfig {
+             misc_control_broadcast: 0x00C1_0FFF,
+             // Reg 0x3C broadcasts (init135 / init136):
+             //   wire bytes `80 00 85 40` and `80 00 80 20`
+-            core_broadcast: [0x4085_0080, 0x2080_0080],
++            // NOTE: `Register::Core` is encoded BIG-endian (`put_u32`),
++            // unlike every other raw register (`put_u32_le`) -- see
++            // `protocol.rs`'s `encode_data`. These must therefore be
++            // stored in natural big-endian order, exactly as bm1362()/
++            // bm1370() do. They were previously stored byte-reversed
++            // (`0x4085_0080`, ...), which BE-encoded to `40 85 00 80`
++            // on the wire -- bit 31 clear, so CORE_MAILBOX's
++            // "apply to all cores" bit was never set and every core
++            // write (including core-enable 0xAA below) targeted a
++            // single garbage core_id instead of the whole chip.
++            core_broadcast: [0x8000_8540, 0x8000_8020],
+             // Reg 0x54 broadcast (init138): wire bytes `00 00 00 03`
+             analog_mux_broadcast: 0x0300_0000,
+             // Reg 0x58 broadcast: wire bytes `02 11 41 11` per live LuxOS
+@@ -392,7 +402,9 @@ pub fn bm1366() -> ChipConfig {
+             // Reg 0x3C per-chip: same three values as the broadcasts
+             // plus the BM1362-style finalizer 0x82AA.
+             //   `80 00 85 40`, `80 00 80 20`, `80 00 82 AA`
+-            core_perchip: [0x4085_0080, 0x2080_0080, 0xAA82_0080],
++            // Big-endian storage order -- see the note on
++            // `core_broadcast` above.
++            core_perchip: [0x8000_8540, 0x8000_8020, 0x8000_82AA],
+         },
+         // LuxOS post-per-chip TicketMask = `0x000000C0` (`zero_bits=2`)
+         // per the BHB56902 capture. Re-enabling now that the earlier
+@@ -607,32 +619,43 @@ mod tests {
+     }
+ 
+     /// Quick sanity check on the BM1366 init register raw values: each
+-    /// LE encoding produces the exact wire bytes documented in
+-    /// ESP-Miner.
++    /// register's OWN encoder must produce the exact wire bytes
++    /// documented in ESP-Miner.
++    ///
++    /// Endianness is per-register and must match `protocol.rs`'s
++    /// `encode_data`: `Register::Core` (0x3C) is written big-endian via
++    /// `put_u32`, every other raw register little-endian via
++    /// `put_u32_le`. This test previously asserted `to_le_bytes()` for
++    /// ALL registers including Core, which let a byte-reversed set of
++    /// BM1366 Core values pass CI while putting `40 85 00 80` on the
++    /// wire instead of `80 00 85 40` (bit 31 clear -> CORE_MAILBOX's
++    /// "all cores" bit never set).
+     #[test]
+     fn bm1366_init_regs_match_esp_miner_wire_bytes() {
+         let regs = bm1366().init_regs;
+-        // (raw_value, expected wire bytes, label)
+-        let cases: &[(u32, [u8; 4], &str)] = &[
+-            (regs.init_control_broadcast, [0x00, 0x07, 0x00, 0x00], "reg 0xA8 bcast"),
+-            (regs.misc_control_broadcast, [0xFF, 0x0F, 0xC1, 0x00], "reg 0x18 bcast"),
+-            (regs.core_broadcast[0], [0x80, 0x00, 0x85, 0x40], "reg 0x3C bcast #1"),
+-            (regs.core_broadcast[1], [0x80, 0x00, 0x80, 0x20], "reg 0x3C bcast #2"),
+-            (regs.analog_mux_broadcast, [0x00, 0x00, 0x00, 0x03], "reg 0x54 bcast"),
+-            (regs.io_driver_broadcast_raw.unwrap(), [0x02, 0x11, 0x41, 0x11], "reg 0x58 bcast"),
+-            (regs.init_control_perchip, [0x00, 0x07, 0x01, 0xF0], "reg 0xA8 per-chip"),
+-            (regs.misc_control_perchip, [0xF0, 0x00, 0xC1, 0x00], "reg 0x18 per-chip"),
+-            (regs.core_perchip[0], [0x80, 0x00, 0x85, 0x40], "reg 0x3C per-chip #1"),
+-            (regs.core_perchip[1], [0x80, 0x00, 0x80, 0x20], "reg 0x3C per-chip #2"),
+-            (regs.core_perchip[2], [0x80, 0x00, 0x82, 0xAA], "reg 0x3C per-chip #3"),
++        // (raw_value, expected wire bytes, big_endian, label)
++        let cases: &[(u32, [u8; 4], bool, &str)] = &[
++            (regs.init_control_broadcast, [0x00, 0x07, 0x00, 0x00], false, "reg 0xA8 bcast"),
++            (regs.misc_control_broadcast, [0xFF, 0x0F, 0xC1, 0x00], false, "reg 0x18 bcast"),
++            (regs.core_broadcast[0], [0x80, 0x00, 0x85, 0x40], true, "reg 0x3C bcast #1"),
++            (regs.core_broadcast[1], [0x80, 0x00, 0x80, 0x20], true, "reg 0x3C bcast #2"),
++            (regs.analog_mux_broadcast, [0x00, 0x00, 0x00, 0x03], false, "reg 0x54 bcast"),
++            (regs.io_driver_broadcast_raw.unwrap(), [0x02, 0x11, 0x41, 0x11], false, "reg 0x58 bcast"),
++            (regs.init_control_perchip, [0x00, 0x07, 0x01, 0xF0], false, "reg 0xA8 per-chip"),
++            (regs.misc_control_perchip, [0xF0, 0x00, 0xC1, 0x00], false, "reg 0x18 per-chip"),
++            (regs.core_perchip[0], [0x80, 0x00, 0x85, 0x40], true, "reg 0x3C per-chip #1"),
++            (regs.core_perchip[1], [0x80, 0x00, 0x80, 0x20], true, "reg 0x3C per-chip #2"),
++            (regs.core_perchip[2], [0x80, 0x00, 0x82, 0xAA], true, "reg 0x3C per-chip #3"),
+         ];
+-        for (raw, expected, label) in cases {
++        for (raw, expected, big_endian, label) in cases {
++            let wire = if *big_endian {
++                raw.to_be_bytes()
++            } else {
++                raw.to_le_bytes()
++            };
+             assert_eq!(
+-                raw.to_le_bytes(),
+-                *expected,
+-                "{label}: raw 0x{raw:08X} → {:02X?}, expected {:02X?}",
+-                raw.to_le_bytes(),
+-                expected
++                wire, *expected,
++                "{label}: raw 0x{raw:08X} → {wire:02X?}, expected {expected:02X?}"
+             );
+         }
+     }
+diff --git a/mujina-miner/src/asic/bm13xx/sequencer.rs b/mujina-miner/src/asic/bm13xx/sequencer.rs
+index d8fe16f..5faed69 100644
+--- a/mujina-miner/src/asic/bm13xx/sequencer.rs
++++ b/mujina-miner/src/asic/bm13xx/sequencer.rs
+@@ -471,7 +471,16 @@ impl Sequencer {
+         }
+ 
+         // Phase 3: Final broadcast configuration
+-        // NonceRange enables actual hashing (HCN - Hash Control Number)
++        // NonceRange enables actual hashing (HCN - Hash Control Number).
++        // Uses the chip family's own captured value. A previous edit
++        // swapped this for `NonceRangeConfig::multi_chip(chip_count)` on
++        // the theory that a single broadcast value makes every chip
++        // search the same subrange -- that was WRONG for this board:
++        // `multi_chip()` buckets 77 chips into its `65..=128` case and
++        // sends the S21 Pro value (`00 00 1e b5`), not the BHB56902
++        // LuxOS-captured BM1366 value (`00 00 10 5a`), and real firmware
++        // (LuxOS) does broadcast a single value here while still
++        // reaching ~39 TH/s.
+         steps.push(Step::new(Command::WriteRegister {
+             broadcast: true,
+             chip_address: 0x00,
+@@ -631,7 +640,9 @@ impl Sequencer {
+             }
+         }
+ 
+-        // Final broadcast: NonceRange and VersionMask
++        // Final broadcast: NonceRange and VersionMask.
++        // Chip-family captured value -- see the matching comment in
++        // `default_reg_config` above for why `multi_chip()` is wrong here.
+         steps.push(Step::new(Command::WriteRegister {
+             broadcast: true,
+             chip_address: 0x00,
+diff --git a/mujina-miner/src/board/mod.rs b/mujina-miner/src/board/mod.rs
+index b441c3a..14ff300 100644
+--- a/mujina-miner/src/board/mod.rs
++++ b/mujina-miner/src/board/mod.rs
+@@ -2,6 +2,7 @@ pub(crate) mod bitaxe;
+ pub mod cpu;
+ pub(crate) mod emberone;
+ pub mod pattern;
++pub(crate) mod psu_bitbang_i2c;
+ pub(crate) mod s19j_pro_amlogic;
+ pub(crate) mod s19j_pro_bitcrane;
+ pub(crate) mod s19k_pro_amlogic;
+diff --git a/mujina-miner/src/board/psu_bitbang_i2c.rs b/mujina-miner/src/board/psu_bitbang_i2c.rs
+new file mode 100644
+index 0000000..f337f16
+--- /dev/null
++++ b/mujina-miner/src/board/psu_bitbang_i2c.rs
+@@ -0,0 +1,177 @@
++//! Synchronous bit-banged I2C over two sysfs GPIO lines, used only for
++//! this specific unit's PSU bus (GPIO 476/477, labelled `I2C_SCL`/
++//! `I2C_SDA` in Bitmain's own `/etc/init.d/S37board_setup`).
++//!
++//! On this hardware/firmware combination the PSU is not reachable via
++//! any real `/dev/i2c-N` character device (confirmed empirically --
++//! `LinuxI2cDevice::open("/dev/i2c-1", 0x10)` fails with ENXIO). This
++//! is a drop-in synchronous transport with the same two primitives
++//! `NativeAmlogicPsu::exchange` needs (`write_byte_transaction`,
++//! `read_byte_transaction`), so only the transport is swapped -- the
++//! real PSU protocol framing (`build_frame`/`parse_frame`/CMD_*) is
++//! untouched.
++
++use std::fs;
++use std::thread::sleep;
++use std::time::Duration;
++
++const HALF_PERIOD: Duration = Duration::from_micros(50);
++
++pub struct BitBangI2cDevice {
++    scl: u32,
++    sda: u32,
++    address: u8,
++}
++
++impl BitBangI2cDevice {
++    pub fn open(scl: u32, sda: u32, address: u16) -> anyhow::Result<Self> {
++        export(scl)?;
++        export(sda)?;
++        let dev = Self {
++            scl,
++            sda,
++            address: address as u8,
++        };
++        dev.release(scl)?;
++        dev.release(sda)?;
++        delay();
++        Ok(dev)
++    }
++
++    /// SMBus "write byte data": START, addr+W, register, byte, STOP.
++    pub fn write_byte_transaction(&mut self, register: u8, byte: u8) -> anyhow::Result<()> {
++        self.start()?;
++        let result = (|| -> anyhow::Result<()> {
++            self.require_ack(self.write_byte(self.address << 1)?)?;
++            self.require_ack(self.write_byte(register)?)?;
++            self.require_ack(self.write_byte(byte)?)?;
++            Ok(())
++        })();
++        self.stop()?;
++        result
++    }
++
++    /// SMBus "receive byte": START, addr+R, read one byte (NAKed), STOP.
++    pub fn read_byte_transaction(&mut self) -> anyhow::Result<u8> {
++        self.start()?;
++        let result = (|| -> anyhow::Result<u8> {
++            self.require_ack(self.write_byte((self.address << 1) | 1)?)?;
++            let mut byte = 0u8;
++            for _ in 0..8 {
++                byte = (byte << 1) | u8::from(self.read_bit()?);
++            }
++            self.write_bit(true)?; // NAK: no more bytes wanted
++            Ok(byte)
++        })();
++        self.stop()?;
++        result
++    }
++
++    fn require_ack(&self, acked: bool) -> anyhow::Result<()> {
++        if acked {
++            Ok(())
++        } else {
++            Err(anyhow::anyhow!(
++                "bit-banged I2C: no ACK from address 0x{:02X}",
++                self.address
++            ))
++        }
++    }
++
++    fn start(&self) -> anyhow::Result<()> {
++        self.release(self.sda)?;
++        self.release(self.scl)?;
++        delay();
++        self.drive_low(self.sda)?;
++        delay();
++        self.drive_low(self.scl)?;
++        delay();
++        Ok(())
++    }
++
++    fn stop(&self) -> anyhow::Result<()> {
++        self.drive_low(self.sda)?;
++        delay();
++        self.release(self.scl)?;
++        delay();
++        self.release(self.sda)?;
++        delay();
++        Ok(())
++    }
++
++    fn write_byte(&self, byte: u8) -> anyhow::Result<bool> {
++        for i in (0..8).rev() {
++            self.write_bit((byte >> i) & 1 != 0)?;
++        }
++        let nak = self.read_bit()?;
++        Ok(!nak)
++    }
++
++    fn write_bit(&self, high: bool) -> anyhow::Result<()> {
++        if high {
++            self.release(self.sda)?;
++        } else {
++            self.drive_low(self.sda)?;
++        }
++        delay();
++        self.release(self.scl)?;
++        delay();
++        self.drive_low(self.scl)?;
++        delay();
++        Ok(())
++    }
++
++    fn read_bit(&self) -> anyhow::Result<bool> {
++        self.release(self.sda)?;
++        delay();
++        self.release(self.scl)?;
++        delay();
++        let bit = get_value(self.sda)?;
++        self.drive_low(self.scl)?;
++        delay();
++        Ok(bit)
++    }
++
++    fn release(&self, gpio: u32) -> anyhow::Result<()> {
++        set_direction(gpio, "in")
++    }
++
++    fn drive_low(&self, gpio: u32) -> anyhow::Result<()> {
++        set_direction(gpio, "out")?;
++        set_value(gpio, false)
++    }
++}
++
++fn delay() {
++    sleep(HALF_PERIOD);
++}
++
++fn gpio_path(gpio: u32, leaf: &str) -> String {
++    format!("/sys/class/gpio/gpio{gpio}/{leaf}")
++}
++
++fn export(gpio: u32) -> anyhow::Result<()> {
++    if fs::metadata(format!("/sys/class/gpio/gpio{gpio}")).is_ok() {
++        return Ok(());
++    }
++    match fs::write("/sys/class/gpio/export", gpio.to_string()) {
++        Ok(()) => Ok(()),
++        Err(e) if e.raw_os_error() == Some(16) => Ok(()), // EBUSY: already exported
++        Err(e) => Err(e.into()),
++    }
++}
++
++fn set_direction(gpio: u32, dir: &str) -> anyhow::Result<()> {
++    fs::write(gpio_path(gpio, "direction"), dir)?;
++    Ok(())
++}
++
++fn set_value(gpio: u32, high: bool) -> anyhow::Result<()> {
++    fs::write(gpio_path(gpio, "value"), if high { "1" } else { "0" })?;
++    Ok(())
++}
++
++fn get_value(gpio: u32) -> anyhow::Result<bool> {
++    let s = fs::read_to_string(gpio_path(gpio, "value"))?;
++    Ok(s.trim() == "1")
++}
+diff --git a/mujina-miner/src/board/s19k_pro_amlogic.rs b/mujina-miner/src/board/s19k_pro_amlogic.rs
+index 1a0b071..128880f 100644
+--- a/mujina-miner/src/board/s19k_pro_amlogic.rs
++++ b/mujina-miner/src/board/s19k_pro_amlogic.rs
+@@ -710,7 +710,19 @@ impl NativeAmlogicPsu {
+         command: u8,
+         payload: &[u8],
+     ) -> anyhow::Result<amlogic_cb_tools::protocol::Frame> {
+-        let mut dev = LinuxI2cDevice::open(&self.i2c_device, self.address)?;
++        // PSU is not reachable via any real /dev/i2c-N device on this
++        // hardware/firmware -- confirmed empirically (ENXIO opening
++        // `self.i2c_device`). It's wired to plain GPIO instead (476/477,
++        // labelled `I2C_SCL`/`I2C_SDA` in Bitmain's own
++        // `/etc/init.d/S37board_setup`), so this bit-bangs the same real
++        // PSU protocol over those two lines instead of `self.i2c_device`.
++        const PSU_SCL_GPIO: u32 = 476;
++        const PSU_SDA_GPIO: u32 = 477;
++        let mut dev = super::psu_bitbang_i2c::BitBangI2cDevice::open(
++            PSU_SCL_GPIO,
++            PSU_SDA_GPIO,
++            self.address,
++        )?;
+         let frame = build_frame(command, payload);
+         for byte in frame {
+             dev.write_byte_transaction(self.write_register, byte)?;
+@@ -1315,7 +1327,9 @@ fn decode_tmp75_celsius(raw: u16) -> f32 {
+     value as f32 * 0.0625
+ }
+ 
+-fn read_psu_response_frame(dev: &mut LinuxI2cDevice) -> anyhow::Result<Vec<u8>> {
++fn read_psu_response_frame(
++    dev: &mut super::psu_bitbang_i2c::BitBangI2cDevice,
++) -> anyhow::Result<Vec<u8>> {
+     let mut first = dev.read_byte_transaction()?;
+     while first != 0x55 && first != NAK_BYTE {
+         first = dev.read_byte_transaction()?;
