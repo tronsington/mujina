@@ -362,6 +362,65 @@ async fn main() -> anyhow::Result<()> {
         chips.len()
     );
 
+    // Round 14: gradual frequency ramp toward bosminer's real proven
+    // operating range (~583-600MHz, watched live during a cold-start
+    // tune session) starting from the already-verified ~50MHz
+    // baseline above. Communication-only (register write + discover),
+    // not sustained hashing -- this validates that *configuring* and
+    // *addressing* chips still works cleanly at each frequency, not
+    // thermal behavior under continuous load, which only a real
+    // mining run can test. PSU voltage is held fixed externally
+    // (already ramped to the proven 15.2V before this tool runs) so
+    // only frequency varies here. Stops at the first regression
+    // rather than pushing through it.
+    if previous_count == EXPECTED_CHIPS {
+        const FREQUENCY_RAMP_MHZ: &[f32] = &[
+            100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 450.0, 500.0, 530.0, 560.0, 580.0,
+            590.0, 600.0,
+        ];
+        println!("\n=== Frequency ramp toward bosminer's real range (583-600MHz) ===");
+        for &mhz in FREQUENCY_RAMP_MHZ {
+            let freq = bm13xx::protocol::Frequency::from_mhz(mhz)
+                .expect("frequency within Frequency::MIN_MHZ..=MAX_MHZ");
+            let pll = freq.calculate_pll();
+            let bytes: [u8; 4] = pll.into();
+            println!(
+                "\n--- Step: PllDivider -> {mhz}MHz (flag={:#04x} fb_div={:#04x} ref_div={:#04x} post_div={:#04x}) ---",
+                bytes[0], bytes[1], bytes[2], bytes[3]
+            );
+            data_writer
+                .send(Command::WriteRegister {
+                    broadcast: true,
+                    chip_address: 0x00,
+                    register: bm13xx::protocol::Register::decode(
+                        bm13xx::protocol::RegisterAddress::PllDivider,
+                        &bytes,
+                    ),
+                })
+                .await?;
+            time::sleep(Duration::from_millis(1000)).await;
+
+            data_writer.send(BM13xxProtocol::discover_chips()).await?;
+            let (step_chips, step_bytes) =
+                read_responses(&mut reader, Duration::from_millis(1000)).await?;
+            report(chain, &format!("{mhz}MHz"), &step_chips, step_bytes);
+
+            if step_chips.len() < previous_count {
+                println!(
+                    "*** REGRESSION HERE: {mhz}MHz dropped responsiveness from {previous_count} to {} chips. Stopping ramp. ***",
+                    step_chips.len()
+                );
+                break;
+            }
+            previous_count = step_chips.len();
+        }
+        println!("\nFrequency ramp ended with {previous_count} chip(s) responsive.");
+    } else {
+        println!(
+            "\nSkipping frequency ramp: baseline discovery ({previous_count}/{EXPECTED_CHIPS}) wasn't clean."
+        );
+    }
+
     println!("Disabling chain {chain} (GPIO {gpio} -> 0)...");
     let _ = fs::write(format!("/sys/class/gpio/gpio{gpio}/value"), "0");
 
