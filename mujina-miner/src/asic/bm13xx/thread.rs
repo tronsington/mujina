@@ -603,12 +603,11 @@ where
 ///   genuine per-chip factory calibration data, not something safe
 ///   to replicate generically across units, but could plausibly be
 ///   load-bearing for actual hashing rather than just tuning.
-/// - `NonceRange` is set to a fixed, unpartitioned value reused from
-///   the BM1370 sequence above (`0xB51E0000`), not derived from real
-///   BM1366 capture -- it was never observed as a broadcast write in
-///   the real capture at all, and adding it didn't change the outcome
-///   (still zero nonces), so either it's genuinely not the gap or its
-///   specific value/encoding matters and this one is wrong.
+/// - `NonceRange` is now the real BM1366 value (`0x5a10_0000`, sourced
+///   from the reference's `chip_config.rs`), not the BM1370-reused
+///   placeholder (`0xB51E0000`) used through Round 14 -- it was never
+///   observed as a broadcast write in this project's own real
+///   capture, so this is the reference's value, not ours.
 async fn initialize_chip_bm1366_chain<W>(
     chip_count: u8,
     domain_config: &[DomainConfigWrite],
@@ -818,42 +817,53 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    // The only PllDivider value ever observed on the real wire,
-    // decoding to exactly 50.0MHz via this same module's
-    // calculate_pll_for_frequency formula (too clean a match to be
-    // coincidence, so the formula itself is trustworthy for this chip
-    // family too). Real hardware testing (HANDOFF.md's Round 7) found
-    // this alone doesn't produce a real hashing chip -- chips accept
-    // jobs but never return a single nonce, at this frequency or at
-    // an experimentally higher one (200MHz, computed via the same
-    // formula, also tested with no change in outcome) -- so frequency
-    // was ruled out as *the* blocker, not confirmed as a fix. Kept at
-    // this confirmed-real value rather than the unverified 200MHz
-    // since it demonstrated no advantage. See HANDOFF.md's Round 7
-    // and Next Steps for the still-open investigation.
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::PllDivider, &[0x40, 0xa8, 0x02, 0x65]),
-    )
-    .await
-    .context("failed to send PllDivider")?;
-
+    // Rounds 12-14 (see HANDOFF.md) tried five real hypotheses for why
+    // nothing above ~300MHz produced real hashing (flat temperature,
+    // zero nonces despite clean communication) -- fb_div range, ramp
+    // granularity, VCO stability mid-ramp, settle time, post-divider
+    // preservation -- all ruled out. A real, independently-developed
+    // reference (github.com/Schnitzel/mujina, amlogic-s19kpro-support
+    // branch, with its own real hardware testing on this exact
+    // BHB56902/S19K Pro hashboard) found two real bugs and one real
+    // structural difference:
+    //
+    // 1. BM1366 requires strict `post_div1 > post_div2`, not `>=`.
+    //    Sourced from bitaxeorg/ESP-Miner's real firmware
+    //    (`components/asic/bm1366.c`'s `pll_get_parameters`), not a
+    //    guess -- see `calculate_pll_bm1366` below, which fixes it.
+    //    Every Round 14 hypothesis used `>=`, which allows
+    //    `post_div1 == post_div2` (e.g. 6x6=36) -- an electrically
+    //    invalid combination for this chip family that BM1362/BM1370
+    //    tolerate but BM1366 doesn't.
+    // 2. This exact hashboard's real factory operating voltage is
+    //    13.9V (Braiins' own bosminer log: `Detected hashboard #2:
+    //    Voltage (Avg.) 13.90 V, Frequency (Avg.) 645 MHz`) -- see
+    //    `PSU_TARGET_VOLTS` in `board/antminer_s19k_am3.rs`. Every
+    //    Round 14 test ran at the 15.2V bring-up ceiling instead.
+    // 3. **The frequency ramp runs last**, after TicketMask/NonceRange
+    //    and the baud switch, not before them. Every Round 12-14
+    //    sequence (including this function's own history) ramped
+    //    frequency *then* configured TicketMask/NonceRange -- cores
+    //    would already be enabled and computing at the ramped
+    //    frequency before the registers that control what they report
+    //    (and how) were ever set to their real values.
+    //
+    // TicketMask, NonceRange, and the baud switch now run immediately
+    // after the per-chip pass and domain config, before frequency
+    // ramping -- matching the reference's real, working order.
     let ticket_mask = TicketMask::new(asic_difficulty);
     send_broadcast(chip_commands, Register::TicketMask(ticket_mask))
         .await
         .context("failed to send TicketMask")?;
 
-    // Never observed as a broadcast write in the real capture (see
-    // this function's doc comment), but chips sent zero nonce
-    // responses at all without *some* NonceRange configured -- reusing
-    // the same fixed value BM1370's own working implementation above
-    // uses (not partitioned per chip, so all 77 chips in a chain
-    // redundantly search the same subrange -- wasteful, but real
-    // hardware confirms it's enough to get chips actually searching,
-    // which a totally missing NonceRange evidently isn't).
+    // Real BM1366 value, sourced from the reference's
+    // `chip_config.rs` (`nonce_range: 0x5a10_0000`), not the reused
+    // BM1370 placeholder (`0xB51E0000`) this function used through
+    // Round 14 -- that value got chips searching *something*, but
+    // never a BM1366-real range.
     send_broadcast(
         chip_commands,
-        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
+        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0x5a10_0000)),
     )
     .await
     .context("failed to send NonceRange")?;
@@ -861,15 +871,14 @@ where
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Switch to bosminer's real confirmed operating baud (3,125,000),
-    // if the board supports it -- untested hypothesis for the still-
-    // open "chips never return a Nonce" investigation (HANDOFF.md's
-    // Round 7/8). Two things have to happen in order: tell the chips
-    // via the real captured UartBaud value first (0x00003011 -- NOT
-    // this module's BaudRate::Baud3M/Baud1M constants, which were
-    // captured from a different chip/board and don't match this
-    // board's real wire bytes), *then* reconfigure the host tty to
-    // match -- reversing the order would leave the host talking at
-    // the old rate to chips already listening at the new one.
+    // if the board supports it. Two things have to happen in order:
+    // tell the chips via the real captured UartBaud value first
+    // (0x00003011 -- NOT this module's BaudRate::Baud3M/Baud1M
+    // constants, which were captured from a different chip/board and
+    // don't match this board's real wire bytes), *then* reconfigure
+    // the host tty to match -- reversing the order would leave the
+    // host talking at the old rate to chips already listening at the
+    // new one.
     if let Some(baud_control) = baud_control {
         const REAL_UART_BAUD_REGISTER_VALUE: u32 = 0x0000_3011;
         const REAL_OPERATING_BAUD: u32 = 3_125_000;
@@ -890,6 +899,34 @@ where
             .set_baud_rate(REAL_OPERATING_BAUD)
             .context("failed to switch host tty to real operating baud")?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Frequency ramp -- deliberately last. Targets 575MHz: the
+    // reference's own real hardware measurement on this exact chip
+    // family (39.68 TH/s on mujina itself, LuxOS gets 39.15-39.33
+    // TH/s at the same point) -- deliberately not the 645MHz factory
+    // ceiling, which their notes call "right at the edge of
+    // stability" (645MHz measured *less* hashrate than 575MHz).
+    const TARGET_MHZ: f32 = 575.0;
+    const RAMP_STEP_MHZ: f32 = 6.25;
+    const RAMP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut mhz = 56.25f32;
+    loop {
+        mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
+            mhz + RAMP_STEP_MHZ
+        } else {
+            TARGET_MHZ
+        };
+        let pll = calculate_pll_bm1366(mhz)
+            .with_context(|| format!("no valid BM1366 PLL config for {mhz}MHz"))?;
+        send_broadcast(chip_commands, Register::PllDivider(pll))
+            .await
+            .with_context(|| format!("failed to send PllDivider for {mhz}MHz ramp step"))?;
+        tokio::time::sleep(RAMP_STEP_DELAY).await;
+        if mhz >= TARGET_MHZ {
+            break;
+        }
     }
 
     Ok(())
@@ -1012,6 +1049,66 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
         best_ref_div,
         post_div,
     ))
+}
+
+/// Calculate a PLL configuration for a target frequency, for BM1366
+/// (this board's real chips, per `ChipId`). Two constraints that
+/// differ from `calculate_pll_for_frequency` above (which backs the
+/// proven Bitaxe/BM1370 path and is left untouched):
+///
+/// - fb_div range `0x90..=0xEB`, not BM1370's `0xA0..=0xEF`
+///   (REFERENCE.md's PLL_DIVIDER section).
+/// - **Strict `post_div1 > post_div2`**, not `>=`. Sourced from
+///   bitaxeorg/ESP-Miner's real firmware (`components/asic/bm1366.c`,
+///   `pll_get_parameters(target, 144, 235, ...)`) via a real,
+///   independently-developed reference for this exact hashboard
+///   (github.com/Schnitzel/mujina, amlogic-s19kpro-support branch) --
+///   this is the bug that made every Round 14 hypothesis fail:
+///   `post_div1 == post_div2` (e.g. 6x6=36) is a real, electrically
+///   invalid combination for this chip family that the non-strict
+///   search happily produced.
+///
+/// Prefers the lowest-VCO valid solution when multiple exist, same
+/// rationale as the reference: keeps the VCO in BM1366's typical
+/// ~2000-2300MHz operating range rather than an arbitrary higher one.
+fn calculate_pll_bm1366(target_freq: f32) -> Option<protocol::PllConfig> {
+    const CRYSTAL_FREQ: f32 = 25.0;
+    const MAX_FREQ_ERROR: f32 = 1.0;
+    const FB_DIV_MIN: u8 = 0x90;
+    const FB_DIV_MAX: u8 = 0xeb;
+
+    let mut best: Option<(u8, u8, u8, u8)> = None;
+    let mut min_error = MAX_FREQ_ERROR;
+    let mut best_vco = f32::MAX;
+
+    for ref_div in [2u8, 1] {
+        for post_div1 in (1u8..=7).rev() {
+            for post_div2 in (1u8..post_div1).rev() {
+                let fb_div_f =
+                    (post_div1 * post_div2) as f32 * target_freq * ref_div as f32 / CRYSTAL_FREQ;
+                let fb_div = fb_div_f.round() as u8;
+                if !(FB_DIV_MIN..=FB_DIV_MAX).contains(&fb_div) {
+                    continue;
+                }
+                let actual_freq =
+                    CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
+                let error = (actual_freq - target_freq).abs();
+                if error > MAX_FREQ_ERROR {
+                    continue;
+                }
+                let vco = fb_div as f32 * CRYSTAL_FREQ / ref_div as f32;
+                if error < min_error || (error <= min_error && vco < best_vco) {
+                    min_error = error.min(min_error);
+                    best_vco = vco;
+                    best = Some((fb_div, ref_div, post_div1, post_div2));
+                }
+            }
+        }
+    }
+
+    let (fb_div, ref_div, post_div1, post_div2) = best?;
+    let post_div = ((post_div1 - 1) << 4) | (post_div2 - 1);
+    Some(protocol::PllConfig::new(fb_div, ref_div, post_div))
 }
 
 /// Internal actor task for BM13xxThread.
