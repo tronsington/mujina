@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 default-run = "mujina-minerd"
+autobins = false
 
 [dependencies]
 anyhow = { workspace = true }
@@ -69,17 +70,26 @@ path = "src/bin/tui.rs"
 [[bin]]
 name = "s19k-probe"
 path = "src/bin/s19k_probe.rs"
+required-features = ["dev-tools"]
 
 [[bin]]
 name = "psu-bitbang-probe"
 path = "src/bin/psu_bitbang_probe.rs"
+required-features = ["dev-tools"]
 
 [[bin]]
 name = "s19k-trace"
 path = "src/bin/s19k_trace.rs"
+required-features = ["dev-tools"]
 
 [features]
 default = []
+
+# Hardware bring-up and diagnostic tools for the Antminer S19K Pro
+# (AM3/Amlogic control board). Not part of a normal build: they poke
+# GPIO/I2C and ptrace other processes directly, and are only useful
+# on that control board. See docs/s19k-pro/.
+dev-tools = []
 skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
 
 [dev-dependencies]
