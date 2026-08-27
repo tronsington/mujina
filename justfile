@@ -49,6 +49,24 @@ _require tool:
         echo "error: {{tool}} is not installed; run 'just setup-tools'" >&2; \
         exit 1; }
 
+# Container engine for the recipes below. Podman is the default and
+# what CI uses; Docker works too. Autodetected, so a Docker-only
+# machine needs no configuration --- override with CONTAINER_ENGINE.
+CONTAINER_ENGINE := env('CONTAINER_ENGINE', shell('command -v podman >/dev/null 2>&1 && echo podman || echo docker'))
+
+# Rootless Podman maps the container's root to the invoking user, so
+# files written into the bind mount stay owned by us. Docker (rootful)
+# does not: without --user, everything cargo writes into target/ and
+# .cache/ lands root-owned on the host and the next host-side build
+# fails on permissions. Running as the host user then makes the image's
+# root-owned /usr/local/cargo unwritable for cargo's package-cache
+# lock, so point CARGO_HOME at the bind-mounted workspace instead.
+# Left empty for Podman, whose existing behavior is unchanged.
+CONTAINER_RUN_ARGS := if CONTAINER_ENGINE == "docker" {
+        "--user " + shell('id -u') + ":" + shell('id -g') +
+        " -e CARGO_HOME=/workspace/.cache/cargo-home"
+    } else { "" }
+
 BUILD_IMAGE := "mujina-build"
 # These files decide the build toolchain image's content. tools.just
 # qualifies because the image runs setup-tools from it.
@@ -57,28 +75,29 @@ IMAGE_INPUTS := "build.Containerfile tools.just"
 # staleness without rebuilding. This matters in CI where podman
 # save/load doesn't preserve layer cache---podman build would
 # rebuild from scratch even with a loaded image. The content-hash
-# tag lets `podman image exists` skip the build entirely.
+# tag lets an `image inspect` probe skip the build entirely.
 BUILD_TAG := shell('sha256sum ' + IMAGE_INPUTS + ' | sha256sum | cut -c1-12')
 
 # Build the build toolchain image (skips if unchanged)
 [group('container')]
 build-image:
-    podman image exists {{BUILD_IMAGE}}:{{BUILD_TAG}} || \
-        podman build -t {{BUILD_IMAGE}}:{{BUILD_TAG}} -f build.Containerfile .
+    {{CONTAINER_ENGINE}} image inspect {{BUILD_IMAGE}}:{{BUILD_TAG}} >/dev/null 2>&1 || \
+        {{CONTAINER_ENGINE}} build -t {{BUILD_IMAGE}}:{{BUILD_TAG}} -f build.Containerfile .
 
 # Remove stale build toolchain images
 [group('container')]
 build-image-clean:
-    podman images --format '{{{{.Repository}}:{{{{.Tag}}' \
+    {{CONTAINER_ENGINE}} images --format '{{{{.Repository}}:{{{{.Tag}}' \
         | grep '^{{BUILD_IMAGE}}:' \
         | grep -v ':{{BUILD_TAG}}$' \
-        | xargs -r podman rmi
+        | xargs -r {{CONTAINER_ENGINE}} rmi
 
 # Run a just recipe inside the build toolchain image
 [group('container')]
 in-container *args: build-image
-    mkdir -p .cache/cargo-registry .cache/cargo-git
-    podman run --rm \
+    mkdir -p .cache/cargo-registry .cache/cargo-git .cache/cargo-home
+    {{CONTAINER_ENGINE}} run --rm \
+        {{CONTAINER_RUN_ARGS}} \
         -v "$(pwd)":/workspace:Z \
         -v "$(pwd)/.cache/cargo-registry":/usr/local/cargo/registry \
         -v "$(pwd)/.cache/cargo-git":/usr/local/cargo/git \
@@ -122,12 +141,12 @@ ci base="auto":
 
 [group('container')]
 container-build tag=`git rev-parse --abbrev-ref HEAD`:
-    podman build -t mujina-minerd:{{tag}} -f Containerfile .
+    {{CONTAINER_ENGINE}} build -t mujina-minerd:{{tag}} -f Containerfile .
 
 [group('container')]
 container-push tag=`git rev-parse --abbrev-ref HEAD`:
-    podman tag mujina-minerd:{{tag}} ghcr.io/256foundation/mujina-minerd:{{tag}}
-    podman push ghcr.io/256foundation/mujina-minerd:{{tag}}
+    {{CONTAINER_ENGINE}} tag mujina-minerd:{{tag}} ghcr.io/256foundation/mujina-minerd:{{tag}}
+    {{CONTAINER_ENGINE}} push ghcr.io/256foundation/mujina-minerd:{{tag}}
 
 # Configure git to use the project's .githooks directory
 [group('setup')]
