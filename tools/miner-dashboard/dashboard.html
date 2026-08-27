@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S19K Pro — Mujina</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2129; --line:#30363d;
+    --fg:#e6edf3; --dim:#8b949e; --dim2:#6e7681;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff;
+    --accent2:#bc8cff; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:16px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+  h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
+  .pill{font:11px/1 var(--mono);padding:5px 9px;border-radius:999px;
+    border:1px solid var(--line);color:var(--dim)}
+  .pill.live{color:var(--ok);border-color:#1f6f34;background:#0f2e18}
+  .pill.down{color:var(--bad);border-color:#6e2320;background:#2d1210}
+  .spacer{flex:1}
+  main{padding:18px 20px 40px;max-width:1600px;margin:0 auto}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card.wide{grid-column:1/-1}
+  .card h2{font-size:11px;margin:0 0 10px;color:var(--dim);
+    text-transform:uppercase;letter-spacing:.9px;font-weight:600}
+  .big{font:600 30px/1.1 var(--mono);letter-spacing:-.5px}
+  .big.sm{font-size:22px}
+  .unit{font-size:13px;color:var(--dim);font-weight:400;margin-left:4px}
+  .sub{color:var(--dim);font-size:12px;margin-top:4px}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:4px 0;
+    border-bottom:1px solid #21262d;font-size:13px}
+  .kv:last-child{border-bottom:0}
+  .kv .k{color:var(--dim)}
+  .kv .v{font-family:var(--mono)}
+  .row{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end}
+  .stat{min-width:110px}
+  .stat .lbl{font-size:10px;color:var(--dim2);text-transform:uppercase;letter-spacing:.7px}
+  .stat .num{font:600 19px/1.2 var(--mono);margin-top:2px}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  .accent{color:var(--accent)} .accent2{color:var(--accent2)}
+  svg{display:block;width:100%;overflow:visible}
+  .bars{display:flex;flex-direction:column;gap:7px;margin-top:4px}
+  .bar{display:grid;grid-template-columns:96px 1fr 62px;gap:9px;align-items:center;font-size:12px}
+  .bar .nm{color:var(--dim);font-family:var(--mono);font-size:11px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .track{height:7px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .fill{height:100%;border-radius:4px;transition:width .4s}
+  .bar .val{text-align:right;font-family:var(--mono)}
+  .note{color:var(--dim2);font-size:11px;margin-top:9px;line-height:1.5}
+  .err{color:var(--bad);font-family:var(--mono);font-size:12px;
+    background:#2d1210;border:1px solid #6e2320;padding:9px 11px;border-radius:7px}
+  footer{color:var(--dim2);font-size:11px;padding:0 20px 30px;max-width:1600px;
+    margin:0 auto;line-height:1.7}
+  code{font-family:var(--mono);color:var(--dim)}
+  .legend{display:flex;gap:14px;font-size:11px;color:var(--dim);margin-bottom:6px}
+  .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;
+    vertical-align:middle}
+</style>
+</head>
+<body>
+<header>
+  <h1>Antminer S19K Pro &middot; Mujina</h1>
+  <span class="pill" id="status">connecting…</span>
+  <span class="pill" id="uptime"></span>
+  <div class="spacer"></div>
+  <span class="pill" id="stamp"></span>
+</header>
+
+<main>
+  <div id="alert"></div>
+
+  <!-- headline -->
+  <div class="grid" style="margin-bottom:14px">
+    <div class="card">
+      <h2>Hashrate — measured from share rate</h2>
+      <div class="big" id="hr-shares">—<span class="unit">TH/s</span></div>
+      <div class="sub">shares &times; difficulty &times; 2<sup>32</sup> over a trailing 3&nbsp;min window — independent of firmware constants</div>
+    </div>
+    <div class="card">
+      <h2>Hashrate — pool 5-min rate</h2>
+      <div class="big accent" id="hr-pool">—<span class="unit">TH/s</span></div>
+      <div class="sub" id="hr-pool-sub">authoritative: only accepted work</div>
+    </div>
+    <div class="card">
+      <h2>Hottest sensor</h2>
+      <div class="big" id="temp-max">—<span class="unit">°C</span></div>
+      <div class="sub" id="temp-sub"></div>
+    </div>
+    <div class="card">
+      <h2>Est. power / efficiency</h2>
+      <div class="big sm" id="watts">—<span class="unit">W</span></div>
+      <div class="sub" id="watts-sub">estimated — APW12 has no current sensor</div>
+    </div>
+  </div>
+
+  <div class="card wide" style="margin-bottom:14px">
+    <h2>Hashrate over time</h2>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--ok)"></span>share-derived</span>
+      <span><span class="sw" style="background:var(--accent)"></span>pool 5-min</span>
+    </div>
+    <div id="chart-hr"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Temperatures</h2>
+      <div class="bars" id="temps"></div>
+      <div id="chart-temp" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Fans</h2>
+      <div class="bars" id="fans"></div>
+      <div class="note" id="fan-note"></div>
+    </div>
+
+    <div class="card">
+      <h2>Shares</h2>
+      <div class="row" style="margin-bottom:8px">
+        <div class="stat"><div class="lbl">accepted</div><div class="num ok" id="s-acc">—</div></div>
+        <div class="stat"><div class="lbl">rejected</div><div class="num" id="s-rej">—</div></div>
+        <div class="stat"><div class="lbl">reject % (recent)</div><div class="num" id="s-rejpct">—</div></div>
+      </div>
+      <div class="kv"><span class="k">submitted (mujina)</span><span class="v" id="s-sub">—</span></div>
+      <div class="kv"><span class="k">pool difficulty</span><span class="v" id="s-diff">—</span></div>
+      <div class="kv"><span class="k">best this run</span><span class="v" id="s-best">—</span></div>
+      <div class="kv"><span class="k">best ever (pool)</span><span class="v" id="s-bestever">—</span></div>
+      <div class="kv"><span class="k">last share</span><span class="v" id="s-last">—</span></div>
+      <div class="kv"><span class="k">submit latency</span><span class="v" id="s-lat">—</span></div>
+      <div class="note" id="s-note"></div>
+    </div>
+
+    <div class="card">
+      <h2>PSU</h2>
+      <div class="big sm" id="volts">—<span class="unit">V</span></div>
+      <div class="sub">target 13.9 V &middot; range 13.9–14.5 V</div>
+      <div id="chart-volts" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Hashboards / threads</h2>
+      <div id="threads"></div>
+      <div class="note">Per-thread hashrate in mujina's API is a fixed
+        nominal constant (83 GH/s &times; chip count) and is <em>not</em>
+        a measurement — shown only to confirm threads are active.</div>
+    </div>
+
+    <div class="card">
+      <h2>Sources / identity</h2>
+      <div id="ident"></div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  Sources: mujina <code>/api/v0/miner</code> on the miner (3 s) &middot;
+  pool Prometheus API (30 s) &middot; HashScope stratum proxy (15 s).
+  <br>
+  Power is <strong>estimated</strong> at nameplate efficiency
+  (120 TH/s @ 2760 W = 23.0 J/TH) scaled by (V/13.9)²; the APW12
+  protocol exposes only voltage and on/off state, so true wattage is not
+  measurable in software. Use a wall meter or PDU for a real figure.
+  <br>
+  mujina's own top-level <code>hashrate</code> field reads 0 until its
+  estimator settles, so this page derives hashrate from share rate instead.
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d=1) => v==null || !isFinite(v) ? "—" : v.toFixed(d);
+const th = v => v==null ? null : v/1e12;
+
+function ago(ts){
+  if(ts==null) return "—";
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if(s<60) return Math.round(s)+"s ago";
+  if(s<3600) return Math.floor(s/60)+"m "+Math.round(s%60)+"s ago";
+  return Math.floor(s/3600)+"h "+Math.floor((s%3600)/60)+"m ago";
+}
+function dur(s){
+  if(s==null) return "—";
+  s=Math.floor(s);
+  const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  if(d) return `${d}d ${h}h`;
+  if(h) return `${h}h ${m}m`;
+  return `${m}m ${s%60}s`;
+}
+function tempClass(c){ return c==null?"":c>=70?"bad":c>=60?"warn":"ok"; }
+
+// multi-series SVG line chart
+function chart(el, series, opts={}){
+  const W=1000, H=opts.h||150, PL=52, PR=10, PT=10, PB=20;
+  const all = series.flatMap(s=>s.pts);
+  if(!all.length){ el.innerHTML = '<div class="sub">no data yet</div>'; return; }
+  const xs=all.map(p=>p[0]), ys=all.map(p=>p[1]);
+  let x0=Math.min(...xs), x1=Math.max(...xs);
+  let y0=opts.y0!=null?opts.y0:Math.min(...ys), y1=Math.max(...ys);
+  if(y1-y0 < (opts.minSpan||1e-9)) { y1=y0+(opts.minSpan||1); }
+  const pad=(y1-y0)*0.12; y0-=pad; y1+=pad;
+  if(x1-x0<1) x1=x0+1;
+  const X=t=>PL+(t-x0)/(x1-x0)*(W-PL-PR);
+  const Y=v=>PT+(1-(v-y0)/(y1-y0))*(H-PT-PB);
+  let g="";
+  for(let i=0;i<=3;i++){
+    const v=y0+(y1-y0)*i/3, y=Y(v);
+    g+=`<line x1="${PL}" x2="${W-PR}" y1="${y}" y2="${y}" stroke="#21262d"/>`;
+    g+=`<text x="${PL-7}" y="${y+3.5}" fill="#6e7681" font-size="10"
+         text-anchor="end" font-family="ui-monospace,monospace">${(opts.fmt||(v=>v.toFixed(0)))(v)}</text>`;
+  }
+  for(const s of series){
+    if(!s.pts.length) continue;
+    const d=s.pts.map((p,i)=>(i?"L":"M")+X(p[0]).toFixed(1)+","+Y(p[1]).toFixed(1)).join(" ");
+    g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.w||1.8}"
+         stroke-linejoin="round" stroke-linecap="round" opacity="${s.op||1}"/>`;
+  }
+  const span=(x1-x0)/60;
+  g+=`<text x="${PL}" y="${H-5}" fill="#6e7681" font-size="10">${span.toFixed(0)}m ago</text>`;
+  g+=`<text x="${W-PR}" y="${H-5}" fill="#6e7681" font-size="10" text-anchor="end">now</text>`;
+  el.innerHTML=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:${H}px">${g}</svg>`;
+}
+
+function bars(el, items, opts){
+  el.innerHTML = items.map(it=>{
+    const pct = Math.max(2, Math.min(100, (it.v-opts.min)/(opts.max-opts.min)*100));
+    return `<div class="bar">
+      <span class="nm" title="${it.name}">${it.name}</span>
+      <span class="track"><span class="fill" style="width:${pct}%;background:${it.color}"></span></span>
+      <span class="val ${it.cls||''}">${it.label}</span></div>`;
+  }).join("");
+}
+
+let poolHist = [];
+
+async function tick(){
+  let d;
+  try{
+    d = await (await fetch("/api/state",{cache:"no-store"})).json();
+  }catch(e){
+    $("status").className="pill down"; $("status").textContent="dashboard unreachable";
+    return;
+  }
+  $("stamp").textContent = new Date().toLocaleTimeString();
+
+  const m = d.miner, pool = d.pool||{}, hs = d.hashscope||{};
+
+  // status
+  if(!m){
+    $("status").className="pill down";
+    $("status").textContent="mujina not responding";
+    $("alert").innerHTML = `<div class="err">Cannot reach mujina at ${d.config.miner_api}
+      — ${d.miner_error||"unknown"}.<br>Is mujina running? If bosminer is running instead,
+      this is expected: mujina's API only exists while mujina does.</div>`;
+    $("uptime").textContent="";
+  } else {
+    $("alert").innerHTML="";
+    $("status").className="pill live";
+    $("status").textContent = m.paused ? "paused" : "mining";
+    $("uptime").textContent = "up " + dur(m.uptime);
+  }
+
+  // headline
+  const hrS = d.hashrate_windowed != null ? th(d.hashrate_windowed) : null;
+  $("hr-shares").innerHTML = (hrS==null?"—":fmt(hrS,1)) + '<span class="unit">TH/s</span>';
+  const hrP = pool.rate_5m!=null ? pool.rate_5m/1e12 : null;
+  $("hr-pool").innerHTML = (hrP==null?"—":fmt(hrP,1)) + '<span class="unit">TH/s</span>';
+  $("hr-pool-sub").textContent = pool.rate_5m_bosminer
+    ? `authoritative · bosminer worker also reporting ${fmt(pool.rate_5m_bosminer/1e12,1)} TH/s`
+    : "authoritative: only accepted work";
+  if(hrP!=null) {
+    poolHist.push([Date.now()/1000, hrP*1e12]);
+    if(poolHist.length>500) poolHist.shift();
+  }
+
+  const tmax = m ? m.temp_max : null;
+  $("temp-max").innerHTML = (tmax==null?"—":fmt(tmax,1)) + '<span class="unit">°C</span>';
+  $("temp-max").className = "big " + tempClass(tmax);
+  $("temp-sub").textContent = tmax==null ? "" :
+    tmax>=70 ? "HIGH — overtemp cutoff is near 75 °C" :
+    tmax>=60 ? "warm but fine" : "comfortable";
+
+  let w = null;
+  if(hrS && m && m.volts){
+    const jth = 23.0 * Math.pow(m.volts/13.9, 2);
+    w = hrS * jth;
+  }
+  $("watts").innerHTML = (w==null?"—":fmt(w,0)) + '<span class="unit">W</span>';
+  $("watts-sub").textContent = (w!=null && hrS)
+    ? `≈ ${fmt(w/hrS,1)} J/TH assumed · nameplate 23.0 J/TH`
+    : "estimated — APW12 has no current sensor";
+
+  // charts
+  chart($("chart-hr"), [
+    {pts:(d.series.hashrate_windowed||[]).map(p=>[p[0],p[1]/1e12]), color:"var(--ok)"},
+    {pts:poolHist.map(p=>[p[0],p[1]/1e12]), color:"var(--accent)", w:2}
+  ], {h:190, y0:0, minSpan:10, fmt:v=>v.toFixed(0)});
+
+  chart($("chart-volts"), [
+    {pts:(d.series.volts||[]), color:"var(--accent2)"}
+  ], {h:90, minSpan:0.4, fmt:v=>v.toFixed(2)});
+
+  // temps
+  if(m && m.temps && m.temps.length){
+    const names = m.temp_names||[];
+    bars($("temps"), m.temps.map((v,i)=>({
+      name: names[i]||("sensor "+i), v,
+      label: fmt(v,1)+"°",
+      cls: tempClass(v),
+      color: v>=70?"var(--bad)":v>=60?"var(--warn)":"var(--ok)"
+    })), {min:20,max:80});
+    const ts = (d.temps_series||[]).filter(s=>s[1] && s[1].length);
+    if(ts.length){
+      const n = ts[ts.length-1][1].length;
+      chart($("chart-temp"),
+        Array.from({length:n},(_,i)=>({
+          pts: ts.map(s=>[s[0], s[1][i]]).filter(p=>p[1]!=null),
+          color:"var(--warn)", w:1.1, op:.55
+        })), {h:80, minSpan:6, fmt:v=>v.toFixed(0)+"°"});
+    }
+  } else { $("temps").innerHTML='<div class="sub">—</div>'; }
+
+  // fans
+  if(m && m.fans && m.fans.length){
+    bars($("fans"), m.fans.map((v,i)=>({
+      name:"fan "+i, v, label: v.toLocaleString(),
+      color: v===0 ? "var(--dim2)" : "var(--accent)"
+    })), {min:0,max:9000});
+    const dead = m.fans.filter(v=>v===0).length;
+    $("fan-note").textContent = dead
+      ? `${dead} channel(s) reading 0 RPM. On this unit fan 3 has always read 0 — an unpopulated channel, not a fault. Verify before ignoring.`
+      : "";
+  }
+
+  // shares
+  // "+" = tally began mid-session, so this is a floor not a true total
+  const plus = hs.partial ? "+" : "";
+  $("s-acc").textContent = hs.accepted!=null ? (hs.accepted+plus) : "—";
+  $("s-rej").textContent = hs.rejected!=null ? (hs.rejected+plus) : "—";
+  const rp = hs.reject_pct_recent!=null ? hs.reject_pct_recent : hs.reject_pct;
+  $("s-rejpct").textContent = rp!=null ? fmt(rp,1)+"%" : "—";
+  $("s-rejpct").className = "num " + (rp==null?"":rp>10?"bad":rp>2?"warn":"ok");
+  $("s-sub").textContent = m && m.shares!=null ? m.shares.toLocaleString() : "—";
+  const diff = (m && m.difficulty) || hs.difficulty;
+  $("s-diff").textContent = diff ? diff.toLocaleString() : "—";
+  $("s-best").textContent = m && m.best_difficulty ? m.best_difficulty.toLocaleString() : "—";
+  $("s-bestever").textContent = pool.best_ever ? Math.round(pool.best_ever).toLocaleString() : "—";
+  $("s-last").textContent = ago(pool.last_share_at);
+  $("s-lat").textContent = hs.latency_ms_avg!=null
+    ? `${fmt(hs.latency_ms_avg,0)} ms avg / ${fmt(hs.latency_ms_max,0)} max` : "—";
+  $("s-note").textContent = (hs.reject_pct!=null && rp!=null && hs.reject_pct-rp > 5)
+    ? "Overall reject % is higher than recent — consistent with a vardiff transient that has since settled, not an ongoing fault."
+    : (hs.error ? "HashScope: "+hs.error : "");
+
+  // psu
+  $("volts").innerHTML = (m && m.volts!=null ? fmt(m.volts,2) : "—") + '<span class="unit">V</span>';
+
+  // threads
+  if(m && m.threads){
+    $("threads").innerHTML = m.threads.map(t=>`<div class="kv">
+      <span class="k">${t.name}</span>
+      <span class="v ${t.active?'ok':'bad'}">${t.active?'active':'inactive'}
+        <span style="color:var(--dim2)">· ${t.nominal?fmt(t.nominal/1e12,2)+' TH/s nom':''}</span></span></div>`).join("");
+  }
+
+  // identity
+  const src = (m && m.sources && m.sources[0]) || {};
+  $("ident").innerHTML = `
+    <div class="kv"><span class="k">board</span><span class="v">${(m&&m.board_model)||"—"}</span></div>
+    <div class="kv"><span class="k">serial</span><span class="v">${(m&&m.serial)||"—"}</span></div>
+    <div class="kv"><span class="k">pool</span><span class="v">${src.name||"—"}</span></div>
+    <div class="kv"><span class="k">via proxy</span><span class="v">${hs.pool_peer||"—"}</span></div>
+    <div class="kv"><span class="k">hs session</span><span class="v">${hs.session||"—"}</span></div>
+    <div class="kv"><span class="k">dashboard up</span><span class="v">${dur(d.dashboard_uptime)}</span></div>`;
+}
+
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

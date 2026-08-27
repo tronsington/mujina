@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S19K Pro — live</title>
+<style>
+/* ═══ S19K Pro live terminal ══════════════════════════════════════
+   The thermal gauge is headroom: (75 - maxTemp) / (75 - 25). 75 C is
+   the real overtemp cutoff, so an empty bar is the actual trip point.
+   ════════════════════════════════════════════════════════════════ */
+:root{
+  --net:#001233; --net2:#000a1f;
+  --panel-a:#0a3a7a; --panel-b:#062a5c; --panel-edge:#1e6fd0;
+  --cy:#29e5ff; --cy-dim:#1a8fb8;
+  --hp:#38f048; --hp-mid:#ffd23f; --hp-low:#ff3b30;
+  --buster:#ff8c1a;
+  --ink:#eaf6ff; --ink-dim:#8fb8dd;
+  --pix:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--net2); color:var(--ink);
+  font:13px/1.45 var(--pix); letter-spacing:.5px;
+  text-transform:uppercase;
+  -webkit-font-smoothing:none; font-smooth:never;
+  overflow-x:hidden;
+}
+/* cyberworld: perspective grid + drifting data streams */
+.net-bg{position:fixed;inset:0;z-index:0;overflow:hidden;
+  background:radial-gradient(ellipse 120% 80% at 50% 0%,#03286b 0%,var(--net) 45%,var(--net2) 100%)}
+.net-bg .grid{position:absolute;left:-50%;right:-50%;bottom:-10%;height:120%;
+  background-image:
+    linear-gradient(rgba(41,229,255,.16) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(41,229,255,.16) 1px,transparent 1px);
+  background-size:64px 64px;
+  transform:perspective(340px) rotateX(64deg);
+  transform-origin:50% 100%;
+  animation:flow 5s linear infinite;
+  mask-image:linear-gradient(to top,#000 0%,transparent 78%);
+  -webkit-mask-image:linear-gradient(to top,#000 0%,transparent 78%);
+}
+@keyframes flow{to{background-position:0 64px,0 0}}
+.net-bg .scan{position:absolute;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,.28) 0 1px,transparent 1px 3px)}
+.net-bg .vig{position:absolute;inset:0;pointer-events:none;
+  box-shadow:inset 0 0 190px 60px rgba(0,4,20,.92)}
+
+.wrap{position:relative;z-index:1;max-width:1180px;margin:0 auto;padding:14px 14px 44px}
+
+/* chamfered panel — the corner cut is the signature */
+.pnl{
+  position:relative;
+  background:linear-gradient(160deg,var(--panel-a) 0%,var(--panel-b) 62%,#03204a 100%);
+  border:2px solid var(--panel-edge);
+  clip-path:polygon(11px 0,100% 0,100% calc(100% - 11px),calc(100% - 11px) 100%,0 100%,0 11px);
+  padding:11px 13px;
+  box-shadow:0 6px 22px rgba(0,0,0,.55),
+             inset 0 1px 0 rgba(140,220,255,.28);
+}
+.pnl::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(180deg,rgba(255,255,255,.09),transparent 40%)}
+.lbl{font-size:9px;color:var(--cy);letter-spacing:2.4px;
+  text-shadow:0 0 8px rgba(41,229,255,.55);margin:0 0 7px}
+
+/* ── header ── */
+.pet-top{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.emblem{width:38px;height:38px;flex:0 0 auto;filter:drop-shadow(0 0 7px rgba(41,229,255,.7))}
+.pet-title{font-size:17px;letter-spacing:3px;
+  text-shadow:0 0 12px rgba(41,229,255,.6),2px 2px 0 #001}
+.pet-title small{display:block;font-size:9px;letter-spacing:2px;color:var(--ink-dim);
+  text-shadow:none;margin-top:3px}
+.jack{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.tag{font-size:9px;letter-spacing:1.6px;padding:5px 9px;border:1px solid var(--cy-dim);
+  color:var(--cy);background:rgba(3,40,107,.75)}
+.tag.on{color:#031;background:var(--hp);border-color:#7dffa0;
+  animation:pulse 1.9s ease-in-out infinite;font-weight:700}
+.tag.off{color:#fff;background:var(--hp-low);border-color:#ff8b84}
+@keyframes pulse{50%{filter:brightness(1.35)}}
+
+/* ── hero: thermal + hashrate ── */
+.hero{display:grid;grid-template-columns:190px 1fr;gap:12px;margin-bottom:12px}
+@media(max-width:760px){.hero{grid-template-columns:1fr}}
+.navi{display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center}
+.navi-art{width:104px;height:104px}
+.navi-name{font-size:13px;letter-spacing:2px;color:var(--cy);
+  text-shadow:0 0 9px rgba(41,229,255,.6)}
+.navi-meta{font-size:9px;color:var(--ink-dim);letter-spacing:1.3px;line-height:1.7}
+
+.hp-row{display:flex;align-items:baseline;gap:10px;margin-bottom:5px;flex-wrap:wrap}
+.hp-word{font-size:14px;letter-spacing:3px;color:#ffe97a;text-shadow:2px 2px 0 #301c00}
+.hp-num{font-size:31px;letter-spacing:1px;text-shadow:2px 2px 0 #001,0 0 14px rgba(255,255,255,.2)}
+.hp-max{font-size:14px;color:var(--ink-dim)}
+/* segmented HP bar */
+.hp-bar{position:relative;height:19px;border:2px solid #0d2b52;background:#00102b;
+  padding:2px;box-shadow:inset 0 0 9px rgba(0,0,0,.85)}
+.hp-fill{height:100%;transition:width .55s cubic-bezier(.2,.8,.3,1),background .4s;
+  background-image:linear-gradient(90deg,rgba(255,255,255,.34) 0 2px,transparent 2px 7px);
+  background-size:7px 100%;background-repeat:repeat-x;background-color:var(--hp);
+  box-shadow:0 0 13px currentColor}
+.hp-note{font-size:9px;color:var(--ink-dim);letter-spacing:1.5px;margin-top:6px}
+
+.buster{margin-top:11px;border-top:1px dashed rgba(41,229,255,.3);padding-top:10px}
+.buster-num{font-size:40px;letter-spacing:-1px;color:var(--buster);
+  text-shadow:0 0 20px rgba(255,140,26,.6),3px 3px 0 #2a1200;line-height:1}
+.buster-num span{font-size:14px;letter-spacing:2px;color:#ffc98a;margin-left:6px}
+.buster-sub{font-size:9px;color:var(--ink-dim);letter-spacing:1.5px;margin-top:5px}
+
+/* ── grid of panels ── */
+.cols{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(268px,1fr))}
+.span2{grid-column:span 2}
+@media(max-width:760px){.span2{grid-column:span 1}}
+
+/* share counters */
+.bust{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}
+.bust-cell{min-width:74px}
+.bust-cell .n{font-size:25px;letter-spacing:0;text-shadow:2px 2px 0 #001}
+.bust-cell .t{font-size:8.5px;color:var(--ink-dim);letter-spacing:1.4px}
+.deleted{color:var(--hp)} .missed{color:var(--hp-low)} .rank{color:#ffe97a}
+.pop{animation:pop .5s ease-out}
+@keyframes pop{0%{transform:scale(1.9);filter:brightness(2.4)}100%{transform:scale(1)}}
+
+/* per-board cards */
+.chips{display:grid;gap:9px;grid-template-columns:repeat(auto-fit,minmax(148px,1fr))}
+.chip{position:relative;border:2px solid #2a7fd4;padding:8px 9px;
+  background:linear-gradient(165deg,#0d4a94,#062a5c);
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px)}
+.chip.dead{border-color:#7a2a2a;background:linear-gradient(165deg,#4a0d0d,#2a0606);opacity:.85}
+.chip .cn{font-size:10.5px;letter-spacing:1.4px;color:#fff;text-shadow:1px 1px 0 #001}
+.chip .cd{font-size:8.5px;color:#9fd2ff;letter-spacing:1.1px;margin-top:3px}
+.chip .cbar{height:7px;background:#00102b;margin-top:7px;border:1px solid #0d2b52;padding:1px}
+.chip .cbar i{display:block;height:100%;background:var(--hp);box-shadow:0 0 7px currentColor;
+  transition:width .5s,background .4s}
+.chip .el{position:absolute;top:6px;right:7px;font-size:8px;color:#ffe97a}
+
+/* stat rows */
+.kv{display:flex;justify-content:space-between;gap:9px;font-size:10px;
+  padding:4px 0;border-bottom:1px dotted rgba(41,229,255,.2)}
+.kv:last-child{border-bottom:0}
+.kv b{color:var(--ink-dim);font-weight:400;letter-spacing:1.2px}
+.kv i{font-style:normal;color:var(--ink);letter-spacing:.6px}
+
+/* meters */
+.mtr{margin:7px 0}
+.mtr .mh{display:flex;justify-content:space-between;font-size:9px;color:var(--ink-dim);
+  letter-spacing:1.2px;margin-bottom:3px}
+.mtr .mb{height:9px;background:#00102b;border:1px solid #0d2b52;padding:1px}
+.mtr .mb i{display:block;height:100%;transition:width .5s,background .4s;
+  box-shadow:0 0 7px currentColor}
+
+svg.chart{display:block;width:100%;overflow:visible}
+.foot{margin-top:16px;font-size:8.5px;color:#4d7ba8;letter-spacing:1.1px;line-height:2;
+  text-transform:none}
+.foot a{color:var(--cy-dim)}
+a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--cy);outline-offset:2px}
+.alarm{border-color:var(--hp-low)!important;
+  animation:alarm 1s steps(2) infinite}
+@keyframes alarm{50%{background:linear-gradient(160deg,#5c0a0a,#2a0606)}}
+
+@media (prefers-reduced-motion: reduce){
+  .net-bg .grid{animation:none}
+  .tag.on,.pop,.alarm{animation:none}
+  *{transition:none!important}
+}
+</style>
+</head>
+<body>
+<div class="net-bg" aria-hidden="true">
+  <div class="grid"></div><div class="scan"></div><div class="vig"></div>
+</div>
+
+<div class="wrap">
+
+  <div class="pet-top">
+    <!-- emblem: geometric, drawn not borrowed -->
+    <svg class="emblem" viewBox="0 0 40 40" aria-hidden="true">
+      <path d="M20 2 36 9v14c0 9-7 13-16 15C11 36 4 32 4 23V9z"
+            fill="#062a5c" stroke="#29e5ff" stroke-width="2.5"/>
+      <path d="M20 9l8 5v8c0 5-4 7-8 8-4-1-8-3-8-8v-8z" fill="#29e5ff" opacity=".22"/>
+      <path d="M14 19h5l-2-6 9 8h-5l2 6z" fill="#ffd23f"/>
+    </svg>
+    <div class="pet-title">MUJINA
+      <small>ANTMINER S19K PRO &nbsp;//&nbsp; BM1366 &times;231</small></div>
+    <div class="jack">
+      <span class="tag" id="t-link">CONNECTING…</span>
+      <span class="tag" id="t-diff">DIFFICULTY —</span>
+      <span class="tag" id="t-clock">--:--:--</span>
+    </div>
+  </div>
+
+  <div id="alert"></div>
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="pnl navi">
+      <p class="lbl" style="align-self:flex-start">MINER</p>
+      <svg class="navi-art" viewBox="0 0 100 100" aria-hidden="true">
+        <circle cx="50" cy="50" r="34" fill="none" stroke="#1e6fd0" stroke-width="1.5"
+                stroke-dasharray="5 4" id="ring"/>
+        <path d="M50 18 76 30v22c0 15-12 22-26 27-14-5-26-12-26-27V30z"
+              fill="#0a3a7a" stroke="#29e5ff" stroke-width="2.5"/>
+        <circle cx="50" cy="46" r="12" fill="#29e5ff" opacity=".28"/>
+        <path d="M40 52h9l-4-11 16 14h-9l4 11z" fill="#ffd23f"/>
+      </svg>
+      <div class="navi-name" id="navi-state">MINING</div>
+      <div class="navi-meta" id="navi-meta">—</div>
+    </div>
+
+    <div class="pnl" id="hp-panel">
+      <p class="lbl">THERMAL HEADROOM</p>
+      <div class="hp-row">
+        <span class="hp-num" id="hp-val">--.-</span>
+        <span class="hp-max">&deg;C HOTTEST</span>
+        <span class="hp-max" id="hp-temp" style="margin-left:auto"></span>
+      </div>
+      <div class="hp-bar"><div class="hp-fill" id="hp-fill" style="width:0%"></div></div>
+      <div class="hp-note" id="hp-note">Bar = margin remaining to the 75&deg;C overtemp cutoff</div>
+
+      <div class="buster">
+        <p class="lbl">HASHRATE</p>
+        <div class="buster-num"><span id="hr-val">—</span><span>TH/S</span></div>
+        <div class="buster-sub" id="hr-sub">awaiting first shares…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PANELS -->
+  <div class="cols">
+
+    <div class="pnl span2">
+      <p class="lbl">HASHRATE &mdash; LAST 30 MIN</p>
+      <div id="chart"></div>
+      <div class="hp-note" style="display:flex;gap:14px;flex-wrap:wrap">
+        <span style="color:var(--buster)">&#9644; LOCAL (share-derived)</span>
+        <span style="color:var(--cy)">&#9644; POOL 5-MIN</span>
+      </div>
+    </div>
+
+    <div class="pnl">
+      <p class="lbl">SHARES</p>
+      <div class="bust">
+        <div class="bust-cell"><div class="n deleted" id="v-del">—</div>
+          <div class="t">ACCEPTED</div></div>
+        <div class="bust-cell"><div class="n missed" id="v-miss">—</div>
+          <div class="t">REJECTED</div></div>
+        <div class="bust-cell"><div class="n" id="v-pct">—</div>
+          <div class="t">REJECT RATE</div></div>
+      </div>
+      <div style="margin-top:10px">
+        <div class="kv"><b>BEST THIS RUN</b><i id="v-best">—</i></div>
+        <div class="kv"><b>BEST EVER (POOL)</b><i class="rank" id="v-bestever">—</i></div>
+        <div class="kv"><b>LAST SHARE</b><i id="v-last">—</i></div>
+        <div class="kv"><b>RESPONSE</b><i id="v-lat">—</i></div>
+      </div>
+      <div class="hp-note" id="v-note"></div>
+    </div>
+
+    <div class="pnl">
+      <p class="lbl">HASHBOARDS</p>
+      <div class="chips" id="chips"></div>
+      <div class="hp-note">Bar = that board's hottest sensor vs cutoff.</div>
+    </div>
+
+    <div class="pnl">
+      <p class="lbl">COOLING SYSTEM</p>
+      <div id="fans"></div>
+      <div class="hp-note" id="fan-note"></div>
+    </div>
+
+    <div class="pnl">
+      <p class="lbl">POWER</p>
+      <div class="hp-row" style="margin-bottom:8px">
+        <span class="hp-num" style="font-size:23px" id="e-volts">—</span>
+        <span class="hp-max">V</span>
+        <span class="hp-max" id="e-watts" style="margin-left:auto"></span>
+      </div>
+      <div class="mtr"><div class="mh"><span>RAIL 13.9&ndash;14.5 V</span>
+        <span id="e-pct">—</span></div>
+        <div class="mb"><i id="e-bar" style="width:0%;background:var(--cy)"></i></div></div>
+      <div class="kv"><b>DRAIN (EST)</b><i id="e-drain">—</i></div>
+      <div class="kv"><b>EFFICIENCY</b><i id="e-jth">—</i></div>
+      <div class="hp-note">No current sensor on the APW12 &mdash; drain is estimated.</div>
+    </div>
+
+    <div class="pnl">
+      <p class="lbl">CONNECTION</p>
+      <div class="kv"><b>POOL</b><i id="l-pool">—</i></div>
+      <div class="kv"><b>UPSTREAM</b><i id="l-peer">—</i></div>
+      <div class="kv"><b>SESSION</b><i id="l-sess">—</i></div>
+      <div class="kv"><b>SERIAL</b><i id="l-serial">—</i></div>
+      <div class="kv"><b>MONITORING FOR</b><i id="l-up">—</i></div>
+      <div class="kv"><b>SUBMITTED</b><i id="l-sub">—</i></div>
+    </div>
+
+  </div>
+
+  <div class="foot">
+    The thermal bar is headroom: (75&nbsp;&minus;&nbsp;hottest&nbsp;sensor)&nbsp;/&nbsp;(75&nbsp;&minus;&nbsp;25),
+    so an empty bar is the real overtemp trip point. Hashrate is derived from
+    share rate over a trailing 180&nbsp;s window, not from firmware-reported
+    hashrate (which is a fixed nominal constant). Drain is estimated at
+    nameplate efficiency scaled by (V/13.9)&sup2; &mdash; the APW12 exposes no
+    current reading. Standard view: <a href="/">/</a> &middot;
+    mujina's own: <a href="/builtin">/builtin</a>
+  </div>
+</div>
+
+<script>
+const $ = i => document.getElementById(i);
+const HOT = 75, COOL = 25;   // real overtemp cutoff / comfortable floor
+let prevDel = null;
+
+const fx = (v,d=1) => (v==null||!isFinite(v)) ? "—" : v.toFixed(d);
+function ago(ts){
+  if(ts==null) return "—";
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if(s<60) return Math.round(s)+"S AGO";
+  if(s<3600) return Math.floor(s/60)+"M AGO";
+  return Math.floor(s/3600)+"H AGO";
+}
+function dur(s){
+  if(s==null) return "—";
+  s=Math.floor(s);
+  const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
+  return h ? `${h}H ${m}M` : `${m}M ${s%60}S`;
+}
+const hpColor = f => f>0.55 ? "var(--hp)" : f>0.28 ? "var(--hp-mid)" : "var(--hp-low)";
+
+function chart(el, series){
+  const W=1000,H=170,PL=54,PR=8,PT=8,PB=18;
+  const all=series.flatMap(s=>s.pts);
+  if(all.length<2){ el.innerHTML='<div class="hp-note">BUFFERING…</div>'; return; }
+  const xs=all.map(p=>p[0]), ys=all.map(p=>p[1]);
+  let x0=Math.min(...xs), x1=Math.max(...xs);
+  let y1=Math.max(...ys,10); let y0=0;
+  y1*=1.15; if(x1-x0<1)x1=x0+1;
+  const X=t=>PL+(t-x0)/(x1-x0)*(W-PL-PR), Y=v=>PT+(1-(v-y0)/(y1-y0))*(H-PT-PB);
+  let g="";
+  for(let i=0;i<=4;i++){
+    const v=y0+(y1-y0)*i/4, y=Y(v);
+    g+=`<line x1="${PL}" x2="${W-PR}" y1="${y}" y2="${y}" stroke="rgba(41,229,255,.16)"/>`;
+    g+=`<text x="${PL-8}" y="${y+3}" fill="#5f92c4" font-size="10" text-anchor="end"
+         font-family="monospace">${v.toFixed(0)}</text>`;
+  }
+  for(const s of series){
+    if(s.pts.length<2) continue;
+    const d=s.pts.map((p,i)=>(i?"L":"M")+X(p[0]).toFixed(1)+","+Y(p[1]).toFixed(1)).join(" ");
+    g+=`<path d="${d}" fill="none" stroke="${s.c}" stroke-width="${s.w||2.2}"
+         stroke-linejoin="round" style="filter:drop-shadow(0 0 5px ${s.c})"/>`;
+  }
+  g+=`<text x="${PL}" y="${H-4}" fill="#4d7ba8" font-size="9" font-family="monospace">
+       ${((x1-x0)/60).toFixed(0)} MIN AGO</text>`;
+  g+=`<text x="${W-PR}" y="${H-4}" fill="#4d7ba8" font-size="9" text-anchor="end"
+       font-family="monospace">NOW</text>`;
+  el.innerHTML=`<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+    style="height:${H}px" role="img" aria-label="Hashrate over time">${g}</svg>`;
+}
+
+let poolPts=[];
+
+async function tick(){
+  let d;
+  try{ d = await (await fetch("/api/state",{cache:"no-store"})).json(); }
+  catch(e){
+    $("t-link").className="tag off"; $("t-link").textContent="DASHBOARD OFFLINE"; return;
+  }
+  const m=d.miner, pool=d.pool||{}, hs=d.hashscope||{};
+  $("t-clock").textContent=new Date().toLocaleTimeString([], {hour12:false});
+
+  // ── connection state
+  if(!m){
+    $("t-link").className="tag off"; $("t-link").textContent="DISCONNECTED";
+    $("navi-state").textContent="OFFLINE";
+    $("navi-state").style.color="var(--hp-low)";
+    $("navi-meta").textContent="MUJINA NOT RESPONDING";
+    $("alert").innerHTML=`<div class="pnl alarm" style="margin-bottom:12px">
+      <p class="lbl" style="color:#ffb4ae">! NO CONNECTION</p>
+      <div style="font-size:10px;line-height:1.8">CANNOT REACH MUJINA.
+      ${(d.miner_error||"").toUpperCase()}<br>
+      IF BOSMINER IS RUNNING INSTEAD, THIS IS EXPECTED &mdash;
+      MUJINA'S API ONLY EXISTS WHILE MUJINA DOES.</div></div>`;
+    $("hp-val").textContent="--.-"; $("hp-fill").style.width="0%";
+    return;
+  }
+  $("alert").innerHTML="";
+  const paused=m.paused;
+  $("t-link").className="tag on";
+  $("t-link").textContent=paused?"PAUSED":"MINING";
+  $("navi-state").textContent=paused?"STANDBY":"MINING";
+  $("navi-state").style.color=paused?"var(--hp-mid)":"var(--cy)";
+  $("navi-meta").innerHTML=`${(m.board_model||"—")}<br>
+    ${(m.threads||[]).filter(t=>t.active).length} / ${(m.threads||[]).length} BOARDS ONLINE`;
+
+  // ── thermal headroom
+  const tmax=m.temp_max;
+  if(tmax!=null){
+    const frac=Math.max(0,Math.min(1,(HOT-tmax)/(HOT-COOL)));
+    $("hp-val").textContent=fx(tmax,1);
+    $("hp-fill").style.width=(frac*100).toFixed(1)+"%";
+    $("hp-fill").style.backgroundColor=hpColor(frac);
+    $("hp-fill").style.color=hpColor(frac);
+    $("hp-temp").textContent=(frac*100).toFixed(0)+"% MARGIN / 75°C CUTOFF";
+    $("hp-panel").classList.toggle("alarm", frac<=0.28);
+    $("hp-note").textContent = frac<=0.28
+      ? "! CRITICAL — APPROACHING OVERTEMP CUTOFF"
+      : frac<=0.55 ? "WARM — MONITOR" : "MARGIN REMAINING TO THE 75°C OVERTEMP CUTOFF";
+  }
+
+  // ── hashrate
+  const hr = d.hashrate_windowed ? d.hashrate_windowed/1e12 : null;
+  $("hr-val").textContent = hr==null ? "—" : fx(hr,1);
+  const poolTh = pool.rate_5m!=null ? pool.rate_5m/1e12 : null;
+  $("hr-sub").textContent = poolTh!=null
+    ? `POOL CONFIRMS ${fx(poolTh,1)} TH/S (5-MIN)`
+    : "awaiting pool confirmation…";
+  if(poolTh!=null){
+    poolPts.push([Date.now()/1000, poolTh]);
+    if(poolPts.length>600) poolPts.shift();
+  }
+  chart($("chart"), [
+    {pts:(d.series.hashrate_windowed||[]).map(p=>[p[0],p[1]/1e12]), c:"#ff8c1a"},
+    {pts:poolPts, c:"#29e5ff", w:1.8}
+  ]);
+
+  // ── shares
+  const del=hs.accepted, miss=hs.rejected;
+  // "+" = tally began mid-session, so this is a floor not a true total
+  const plus = hs.partial ? "+" : "";
+  $("v-del").textContent = del!=null?(del+plus):"—";
+  $("v-miss").textContent = miss!=null?(miss+plus):"—";
+  const mr = hs.reject_pct_recent!=null?hs.reject_pct_recent:hs.reject_pct;
+  $("v-pct").textContent = mr!=null?fx(mr,0)+"%":"—";
+  $("v-pct").className="n "+(mr==null?"":mr>10?"missed":mr>2?"":"deleted");
+  if(prevDel!=null && del!=null && del>prevDel){
+    const n=$("v-del"); n.classList.remove("pop"); void n.offsetWidth; n.classList.add("pop");
+  }
+  prevDel = del;
+  $("v-best").textContent = m.best_difficulty ? m.best_difficulty.toLocaleString() : "—";
+  $("v-bestever").textContent = pool.best_ever ? Math.round(pool.best_ever).toLocaleString() : "—";
+  $("v-last").textContent = ago(pool.last_share_at);
+  $("v-lat").textContent = hs.latency_ms_avg!=null ? fx(hs.latency_ms_avg,0)+" MS" : "—";
+  const notes = [];
+  if(hs.partial) notes.push("\u201C+\u201D = COUNTING BEGAN MID-SESSION; TOTALS ARE A FLOOR. \u201CSUBMITTED\u201D BELOW IS MUJINA\u2019S OWN FULL-RUN COUNT.");
+  if(hs.reject_pct!=null && mr!=null && hs.reject_pct-mr>5)
+    notes.push("OVERALL REJECT RATE EXCEEDS RECENT \u2014 CONSISTENT WITH A SETTLED VARDIFF STEP, NOT A FAULT.");
+  $("v-note").textContent = notes.join(" ");
+  $("t-diff").textContent = "DIFF " + (m.difficulty ? m.difficulty.toLocaleString() : "—");
+
+  // ── hashboards
+  const names=m.temp_names||[], temps=m.temps||[];
+  const boards=(m.threads||[]).map((th,i)=>{
+    // sensors are (inlet,outlet) per board, in order
+    const pair=temps.slice(i*2,i*2+2).filter(v=>v!=null);
+    const hot=pair.length?Math.max(...pair):null;
+    return {name:(th.name||"HB"+i).replace(/^S19kProAmlogic-/,""), active:th.active, hot};
+  });
+  $("chips").innerHTML = boards.map((b,i)=>{
+    const frac = b.hot==null?0:Math.max(0,Math.min(1,(HOT-b.hot)/(HOT-COOL)));
+    return `<div class="chip ${b.active?'':'dead'}">
+      <span class="el">${b.active?'&#9679;':'&#10007;'}</span>
+      <div class="cn">${b.name}</div>
+      <div class="cd">${b.active?'ONLINE':'OFFLINE'} &middot; ${b.hot==null?'—':fx(b.hot,1)+'°C'}</div>
+      <div class="cbar"><i style="width:${(frac*100).toFixed(0)}%;
+        background:${hpColor(frac)};color:${hpColor(frac)}"></i></div></div>`;
+  }).join("");
+
+  // ── cooling
+  const fans=m.fans||[];
+  $("fans").innerHTML = fans.map((v,i)=>{
+    const pct=Math.max(0,Math.min(100,v/9000*100));
+    const dead=v===0;
+    return `<div class="mtr"><div class="mh"><span>FAN ${i}</span>
+      <span>${v.toLocaleString()} RPM</span></div>
+      <div class="mb"><i style="width:${pct.toFixed(0)}%;
+        background:${dead?'#3a536b':'var(--cy)'};color:${dead?'#3a536b':'var(--cy)'}"></i>
+      </div></div>`;
+  }).join("");
+  const dead=fans.filter(v=>v===0).length;
+  $("fan-note").textContent = dead
+    ? `${dead} CHANNEL(S) AT 0 RPM. FAN 3 HAS ALWAYS READ 0 ON THIS UNIT — UNPOPULATED, NOT A FAULT. VERIFY BEFORE IGNORING.`
+    : "ALL CHANNELS TURNING.";
+
+  // ── energy
+  const v=m.volts;
+  $("e-volts").textContent = v!=null?fx(v,2):"—";
+  if(v!=null){
+    const p=Math.max(0,Math.min(100,(v-13.5)/(14.7-13.5)*100));
+    $("e-bar").style.width=p.toFixed(0)+"%";
+    $("e-pct").textContent=fx(v,2)+" V";
+  }
+  const w=m.est_watts;
+  $("e-watts").textContent = w!=null?fx(w/1000,2)+" KW":"";
+  $("e-drain").textContent = w!=null?fx(w,0)+" W (EST)":"—";
+  $("e-jth").textContent = (w!=null&&hr)?fx(w/hr,1)+" J/TH":"—";
+
+  // ── link
+  const src=(m.sources||[])[0]||{};
+  $("l-pool").textContent = (src.name||"—").toUpperCase();
+  $("l-peer").textContent = hs.pool_peer||"—";
+  $("l-sess").textContent = hs.session||"—";
+  $("l-serial").textContent = m.serial||"—";
+  $("l-up").textContent = dur(d.dashboard_uptime);
+  $("l-sub").textContent = m.shares!=null?m.shares.toLocaleString():"—";
+}
+
+tick(); setInterval(tick, 3000);
+</script>
+</body>
+</html>
