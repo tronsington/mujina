@@ -135,3 +135,32 @@ setup-hooks:
     git config core.hooksPath .githooks
     @echo "Git hooks configured to use .githooks/"
     @ls .githooks/ | sed 's/^/  - /'
+
+# Cross-build target for the Antminer S19K Pro's Amlogic AM3 control
+# board: a 4.9.113 aarch64 vendor kernel running 32-bit ARM EABI
+# userspace, hence armv7 rather than aarch64. The compiler, linker and
+# archiver wiring lives in .cargo/config.toml, so no environment needs
+# setting. Details: docs/s19k-pro/running-it.md.
+S19K_TARGET := "armv7-unknown-linux-musleabihf"
+
+# Download the pinned zig cross toolchain (no-op once present)
+[group('s19k')]
+fetch-zig:
+    tools/cross/fetch-zig.sh
+
+# Cross-compile the daemon for the S19K Pro control board
+[group('s19k')]
+build-s19k *args: fetch-zig
+    @rustup target list --installed 2>/dev/null | grep -qx '{{S19K_TARGET}}' \
+        || rustup target add {{S19K_TARGET}}
+    cargo build --release --locked --target {{S19K_TARGET}} \
+        --bin mujina-minerd {{args}}
+
+# `scp -O` because the miner's SSH server is old enough that
+# SFTP-based transfer fails. The miner's /tmp is a tmpfs wiped on
+# reboot, so this needs redoing after a miner restart.
+#
+# Copy the cross-built daemon to a miner, e.g. root@10.0.0.5
+[group('s19k')]
+deploy-s19k host: build-s19k
+    scp -O target/{{S19K_TARGET}}/release/mujina-minerd {{host}}:/tmp/mujina-minerd

@@ -1,0 +1,17 @@
+#!/bin/sh
+# `zig ar` as the archiver for armv7-unknown-linux-musleabihf builds.
+# Companion to zigcc-armv7-musleabihf; same zig discovery order.
+set -eu
+
+if [ -n "${ZIG:-}" ]; then
+    :
+elif [ -x "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/zig/zig" ]; then
+    ZIG=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/zig/zig
+elif command -v zig >/dev/null 2>&1; then
+    ZIG=zig
+else
+    echo "zigar: no zig found. Run tools/cross/fetch-zig.sh, or set ZIG." >&2
+    exit 1
+fi
+
+exec "$ZIG" ar "$@"

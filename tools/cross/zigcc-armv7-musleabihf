@@ -1,0 +1,35 @@
+#!/bin/sh
+# `zig cc` as a C compiler and linker for armv7-unknown-linux-musleabihf.
+#
+# Two things make a plain `zig cc -target ...` insufficient here, both
+# created by cargo's build system rather than by zig:
+#
+#  1. Cargo passes its own `--target=<rust triple>` through to the C
+#     compiler. Zig does not understand Rust triples, so those have to
+#     be dropped before zig sees them; the target is supplied below.
+#  2. The argument list has to survive being re-quoted, so each
+#     argument is requoted individually rather than word-split.
+set -eu
+
+# zig, in order of preference: an explicit $ZIG, the repo-local copy
+# from fetch-zig.sh, then whatever is on PATH.
+if [ -n "${ZIG:-}" ]; then
+    :
+elif [ -x "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/zig/zig" ]; then
+    ZIG=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/zig/zig
+elif command -v zig >/dev/null 2>&1; then
+    ZIG=zig
+else
+    echo "zigcc: no zig found. Run tools/cross/fetch-zig.sh, or set ZIG." >&2
+    exit 1
+fi
+
+args=""
+for a in "$@"; do
+    case "$a" in
+        --target=*) continue ;;
+    esac
+    args="$args \"$a\""
+done
+
+eval exec "\"\$ZIG\"" cc --target=arm-linux-musleabihf $args

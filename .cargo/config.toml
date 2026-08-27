@@ -1,0 +1,23 @@
+# Cross-compilation for the Antminer S19K Pro's Amlogic AM3 control
+# board: a 4.9.113 aarch64 vendor kernel that runs 32-bit ARM EABI
+# userspace, so the target is armv7 musl rather than aarch64.
+#
+# `zig cc` stands in for a musl cross-toolchain -- one self-contained
+# download, no root, no separately built sysroot. Run
+# tools/cross/fetch-zig.sh once to populate tools/cross/zig, then
+# `just build-s19k` (or plain `cargo build --target
+# armv7-unknown-linux-musleabihf`) works with no environment set.
+#
+# Full rationale and the deploy/run steps: docs/s19k-pro/running-it.md.
+[target.armv7-unknown-linux-musleabihf]
+linker = "tools/cross/zigcc-armv7-musleabihf"
+# zig supplies musl's startup objects and libc itself, so rustc must
+# not also link its own bundled self-contained copies.
+rustflags = ["-C", "link-self-contained=no"]
+
+# The `cc` crate reads these when a dependency builds C code. Marked
+# relative so they resolve against the repository root rather than the
+# directory cargo happens to be invoked from.
+[env]
+CC_armv7_unknown_linux_musleabihf = { value = "tools/cross/zigcc-armv7-musleabihf", relative = true }
+AR_armv7_unknown_linux_musleabihf = { value = "tools/cross/zigar-armv7-musleabihf", relative = true }
