@@ -8,6 +8,12 @@ all-features = true
 [licenses]
 # Licenses acceptable for redistribution with our GPL-3.0-or-later
 # binary. Every dependency must match at least one entry.
+#
+# The rustls chain (ring, untrusted, rustls-webpki, webpki-roots) is
+# here because reqwest is configured for rustls instead of its default
+# native-tls: openssl-sys does not cross-compile to the
+# armv7-unknown-linux-musleabihf target the Antminer S19K Pro control
+# board needs. See docs/s19k-pro/running-it.md.
 allow = [
     "0BSD",
     "Apache-2.0",
@@ -16,7 +22,15 @@ allow = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
+    # webpki-roots ships Mozilla's CA root store as data rather than
+    # code, under the Community Data License Agreement. Permissive,
+    # no copyleft, no redistribution restrictions.
+    "CDLA-Permissive-2.0",
     "GPL-3.0-or-later",
+    # ring, untrusted and rustls-webpki. OSI-approved and FSF
+    # Free/Libre, functionally equivalent to the BSD-2-Clause and MIT
+    # terms already allowed above.
+    "ISC",
     "MIT",
     "MITNFA",
     "MPL-2.0",
