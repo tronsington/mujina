@@ -19,8 +19,9 @@ use crate::{
     scheduler::ThreadRegistration,
     tracing::prelude::*,
     transport::{
-        TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
-        usb::TransportEvent as UsbTransportEvent,
+        TransportEvent, UsbDeviceInfo,
+        antminer_s19k_am3::TransportEvent as AntminerS19kAm3TransportEvent,
+        cpu::TransportEvent as CpuTransportEvent, usb::TransportEvent as UsbTransportEvent,
     },
 };
 
@@ -103,6 +104,9 @@ impl Backplane {
                 }
                 TransportEvent::Cpu(cpu_event) => {
                     self.handle_cpu_event(cpu_event).await?;
+                }
+                TransportEvent::AntminerS19kAm3(s19k_event) => {
+                    self.handle_antminer_s19k_am3_event(s19k_event).await?;
                 }
                 TransportEvent::InitialEnumerationComplete => {
                     completed.insert(transport);
@@ -283,6 +287,49 @@ impl Backplane {
                 self.start_board(board_id, conn).await;
             }
             CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
+                if let Some(mut board) = self.boards.remove(&device_id) {
+                    board.shutdown().await;
+                    info!(board = %board.info.model, serial = %device_id, "Board disconnected");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle Antminer S19K Pro (AM3) virtual transport events.
+    async fn handle_antminer_s19k_am3_event(
+        &mut self,
+        event: AntminerS19kAm3TransportEvent,
+    ) -> Result<()> {
+        match event {
+            AntminerS19kAm3TransportEvent::DeviceConnected(device_info) => {
+                let Some(descriptor) = self.virtual_registry.find("antminer_s19k_am3") else {
+                    error!("No virtual board descriptor found for antminer_s19k_am3");
+                    return Ok(());
+                };
+
+                info!(
+                    board = descriptor.name,
+                    "Antminer S19K Pro board connected."
+                );
+
+                let conn = match (descriptor.create_fn)().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!(
+                            board = descriptor.name,
+                            error = %e,
+                            "Failed to create Antminer S19K Pro board"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let board_id = device_info.device_id.clone();
+                self.start_board(board_id, conn).await;
+            }
+            AntminerS19kAm3TransportEvent::DeviceDisconnected { device_id } => {
                 if let Some(mut board) = self.boards.remove(&device_id) {
                     board.shutdown().await;
                     info!(board = %board.info.model, serial = %device_id, "Board disconnected");

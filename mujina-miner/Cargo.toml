@@ -50,7 +50,7 @@ ruint = "1.17.0"
 core-foundation = { workspace = true }
 io-kit-sys = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tracing-journald = { workspace = true }
 udev = { workspace = true }
 
@@ -65,6 +65,18 @@ path = "src/bin/cli.rs"
 [[bin]]
 name = "mujina-tui"
 path = "src/bin/tui.rs"
+
+[[bin]]
+name = "s19k-probe"
+path = "src/bin/s19k_probe.rs"
+
+[[bin]]
+name = "psu-bitbang-probe"
+path = "src/bin/psu_bitbang_probe.rs"
+
+[[bin]]
+name = "s19k-trace"
+path = "src/bin/s19k_trace.rs"
 
 [features]
 default = []

@@ -596,7 +596,27 @@ impl Register {
                 Register::UartBaud(baud)
             }
             RegisterAddress::UartRelay => Register::UartRelay { raw_value },
-            RegisterAddress::Core => Register::Core { raw_value },
+            // Core is the one register whose wire encoding is
+            // big-endian (see encode_data's "Core register needs
+            // big-endian encoding" comment) -- every other register
+            // here uses `raw_value` (little-endian) consistently with
+            // its own encode_data. Decoding Core with the generic
+            // little-endian `raw_value` produced a semantically
+            // different 32-bit value than what was actually captured
+            // on the wire, which -- once re-encoded via encode_data's
+            // real big-endian `put_u32` -- silently sent a malformed
+            // CORE_MAILBOX command (see REFERENCE.md's "0x3C -
+            // CORE_MAILBOX") instead of the intended one. Found via
+            // HANDOFF.md's Round 9: real hardware testing showed the
+            // Core write corrupting chip communication for an
+            // extended period; decoding the real captured bytes
+            // big-endian instead cleanly matches REFERENCE.md's
+            // documented bring-up values (e.g. `80 00 85 40` decodes
+            // to core register 0x05 = 0x40, broadcast, write --
+            // exactly the documented "clock select" value).
+            RegisterAddress::Core => Register::Core {
+                raw_value: u32::from_be_bytes(*bytes),
+            },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value },
             RegisterAddress::IoDriverStrength => {
                 // Parse driver strength from raw value

@@ -147,13 +147,24 @@ const GROUPS: &[EnvGroup] = &[
     },
     EnvGroup {
         title: "Hardware",
-        vars: &[EnvVar {
-            name: "MUJINA_USB_DISABLE",
-            summary: "Set to any value to skip USB board discovery, useful for \
-                      CPU-only runs.",
-            default: Some("unset enables USB discovery"),
-            example: None,
-        }],
+        vars: &[
+            EnvVar {
+                name: "MUJINA_USB_DISABLE",
+                summary: "Set to any value to skip USB board discovery, useful for \
+                          CPU-only runs.",
+                default: Some("unset enables USB discovery"),
+                example: None,
+            },
+            EnvVar {
+                name: "MUJINA_ANTMINER_S19K_AM3_ENABLE",
+                summary: "Set to any value to enable the Antminer S19K Pro \
+                          (AM3/Amlogic control board) virtual device -- this \
+                          board isn't discovered from hardware, it IS the host \
+                          control board.",
+                default: Some("unset disables it"),
+                example: None,
+            },
+        ],
     },
     EnvGroup {
         title: "Logging",

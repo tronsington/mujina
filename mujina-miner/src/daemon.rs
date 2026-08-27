@@ -23,8 +23,15 @@ use crate::{
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
-    transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
+    transport::{
+        AntminerS19kAm3DeviceInfo, CpuDeviceInfo, TransportEvent, UsbTransport,
+        antminer_s19k_am3 as antminer_s19k_am3_transport, cpu as cpu_transport,
+    },
 };
+
+/// Set (to any value) to enable the Antminer S19K Pro (AM3/Amlogic
+/// control board) virtual device.
+const ANTMINER_S19K_AM3_ENABLE_VAR: &str = "MUJINA_ANTMINER_S19K_AM3_ENABLE";
 
 /// The main daemon.
 pub struct Daemon {
@@ -86,6 +93,30 @@ impl Daemon {
                 .send(TransportEvent::InitialEnumerationComplete)
                 .await;
             transport_rxs.push(cpu_rx);
+        }
+
+        // Inject the Antminer S19K Pro virtual device if configured.
+        // Like the CPU miner, this board isn't discovered from
+        // hardware -- it *is* the host control board -- so its
+        // "connection" is synthesized once here, gated by presence
+        // of the enable var rather than any per-instance config.
+        if env::var(ANTMINER_S19K_AM3_ENABLE_VAR).is_ok() {
+            info!("Antminer S19K Pro (AM3) enabled");
+            let (s19k_tx, s19k_rx) = mpsc::channel::<TransportEvent>(100);
+            let device = TransportEvent::AntminerS19kAm3(
+                antminer_s19k_am3_transport::TransportEvent::DeviceConnected(
+                    AntminerS19kAm3DeviceInfo {
+                        device_id: "antminer-s19k-am3".to_string(),
+                    },
+                ),
+            );
+            if let Err(e) = s19k_tx.send(device).await {
+                error!("Failed to send Antminer S19K Pro event: {}", e);
+            }
+            let _ = s19k_tx
+                .send(TransportEvent::InitialEnumerationComplete)
+                .await;
+            transport_rxs.push(s19k_rx);
         }
 
         // Board registration channel: backplane forwards board

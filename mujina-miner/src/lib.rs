@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod env_help;
 pub mod hw_trait;
 pub mod job_source;
+pub mod linux_hw;
 pub mod mgmt_protocol;
 pub mod peripheral;
 pub mod scheduler;

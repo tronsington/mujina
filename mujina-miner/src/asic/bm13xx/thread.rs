@@ -125,12 +125,17 @@ impl BM13xxThread {
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
+    /// * `init_strategy` - How to bring this chip/chain up on first work
+    ///   assignment (register sequence, addressing scheme) -- different
+    ///   chip families/topologies need genuinely different sequences,
+    ///   not just different tuning constants.
     pub fn new<R, W>(
         name: String,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
         removal_rx: watch::Receiver<ThreadRemovalSignal>,
+        init_strategy: ChipInitStrategy,
     ) -> Self
     where
         R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
@@ -153,6 +158,7 @@ impl BM13xxThread {
                 chip_responses,
                 chip_commands,
                 peripherals,
+                init_strategy,
             )
             .await;
         });
@@ -165,6 +171,54 @@ impl BM13xxThread {
             status,
         }
     }
+}
+
+/// A single per-chip addressed register write: (chip_address,
+/// register_address, raw 4-byte wire data). Used by
+/// [`ChipInitStrategy::Bm1366Chain`] to replay a captured domain
+/// config table verbatim -- see `board/antminer_s19k_am3.rs` for
+/// where these values come from.
+pub type DomainConfigWrite = (u8, protocol::RegisterAddress, [u8; 4]);
+
+/// Reconfigures a chip UART's baud rate on the host side, after the
+/// chip side is told to switch via a `UartBaud` register write.
+///
+/// Deliberately transport-agnostic (this module has no dependency on
+/// `crate::transport`) -- boards that need a real baud switch during
+/// bring-up (see [`ChipInitStrategy::Bm1366Chain`]) implement this
+/// against whatever concrete serial transport they use.
+pub trait BaudControl: Send + Sync {
+    fn set_baud_rate(&self, baud: u32) -> Result<()>;
+}
+
+/// How to bring a BM13xx chip or chain up on first work assignment.
+///
+/// Different chip families and board topologies need genuinely
+/// different register sequences, not just different tuning constants
+/// plugged into one generic algorithm -- see `initialize_chip`'s
+/// dispatch below for why this isn't a single parameterized function.
+pub enum ChipInitStrategy {
+    /// A single BM1370 chip at address 0 (Bitaxe Gamma) -- the
+    /// original tuned sequence this module shipped with.
+    Bm1370Single,
+
+    /// A chain of `chip_count` BM1366 chips sharing one UART
+    /// (Antminer S19K Pro AM3-style boards). Addresses every chip via
+    /// a `SetChipAddress` sweep before configuring, then replays
+    /// `domain_config` verbatim (semantics not fully understood yet --
+    /// see HANDOFF.md's Round 5/6 -- so captured real bytes are used
+    /// rather than a guessed-at general rule).
+    Bm1366Chain {
+        chip_count: u8,
+        domain_config: &'static [DomainConfigWrite],
+        /// If present, switches both the chip side (`UartBaud`
+        /// register write) and the host tty to `bosminer`'s real
+        /// confirmed 3,125,000 operating baud after the rest of
+        /// bring-up completes -- see HANDOFF.md's Round 7/8 for why
+        /// this is untested-but-plausible rather than confirmed.
+        /// `None` stays at the discovery-time 115200 baud throughout.
+        baud_control: Option<Box<dyn BaudControl>>,
+    },
 }
 
 #[async_trait]
@@ -238,10 +292,52 @@ impl HashThread for BM13xxThread {
     }
 }
 
-/// Initialize BM13xx chip for mining.
+/// Dispatch chip/chain bring-up to the strategy-appropriate
+/// implementation.
+///
+/// Kept as a thin dispatcher rather than one parameterized function:
+/// the two strategies differ in more than tuning constants (single
+/// chip at a fixed address vs. an N-chip daisy-chain sweep, entirely
+/// different captured register sequences), so sharing one function
+/// body would mean threading chip-count/addressing-mode conditionals
+/// through nearly every line rather than two clearly-scoped
+/// implementations.
+async fn initialize_chip<W>(
+    strategy: &ChipInitStrategy,
+    chip_commands: &mut W,
+    peripherals: &mut BoardPeripherals,
+    asic_difficulty: Log2Difficulty,
+) -> Result<()>
+where
+    W: Sink<protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    match strategy {
+        ChipInitStrategy::Bm1370Single => {
+            initialize_chip_bm1370_single(chip_commands, peripherals, asic_difficulty).await
+        }
+        ChipInitStrategy::Bm1366Chain {
+            chip_count,
+            domain_config,
+            baud_control,
+        } => {
+            initialize_chip_bm1366_chain(
+                *chip_count,
+                domain_config,
+                baud_control.as_deref(),
+                chip_commands,
+                peripherals,
+                asic_difficulty,
+            )
+            .await
+        }
+    }
+}
+
+/// Initialize a single BM1370 chip for mining (Bitaxe Gamma).
 ///
 /// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip<W>(
+async fn initialize_chip_bm1370_single<W>(
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
@@ -472,6 +568,370 @@ where
     Ok(())
 }
 
+/// Initialize a chain of `chip_count` BM1366 chips (Antminer S19K Pro
+/// AM3-style boards) for mining.
+///
+/// The sequence is real, captured wire data (via a ptrace syscall
+/// tracer against `bosminer`'s own successful bring-up -- see
+/// HANDOFF.md's Round 4/5/6), not a guessed-at adaptation of the
+/// BM1370 sequence above -- BM1366's actual required order and
+/// register values differ genuinely, not just in tuning constants
+/// (`initialize_chip`'s doc comment has the full rationale for why
+/// this is a separate function rather than a shared parameterized
+/// one).
+///
+/// **Real hashing is not yet confirmed working** (see HANDOFF.md's
+/// "Round 7"). This sequence gets chips discovered, addressed, and
+/// accepting well-formed `JobFull` commands over the real wire -- but
+/// zero `Nonce` responses were ever observed on real hardware, even
+/// after ruling out two real hypotheses (missing `NonceRange`; PLL
+/// frequency too low) by testing fixes for each with no change in
+/// outcome. The remaining known gaps below are the next things to
+/// investigate, not a complete list of "safe to ignore" caveats the
+/// way they might read for an otherwise-working sequence:
+/// - Switches to `bosminer`'s real 3,125,000 operating baud only if
+///   the caller supplies a [`BaudControl`] -- untested on real
+///   hardware as of this writing (see HANDOFF.md's Round 8). Uses
+///   the exact captured `UartBaud` wire value (`0x00003011`), not
+///   this module's `BaudRate::Baud3M`/`Baud1M` constants, which were
+///   captured from a different chip/board and don't match. With no
+///   `BaudControl` supplied, stays at the discovery-time 115200 baud
+///   throughout, matching Round 7's behavior.
+/// - Skips the per-chip addressed `InitControl`/`MiscControl`/`Core`/
+///   `PllDivider` writes observed at specific individual chip
+///   addresses (distinct from `domain_config`) -- these look like
+///   genuine per-chip factory calibration data, not something safe
+///   to replicate generically across units, but could plausibly be
+///   load-bearing for actual hashing rather than just tuning.
+/// - `NonceRange` is now the real BM1366 value (`0x5a10_0000`, sourced
+///   from the reference's `chip_config.rs`), not the BM1370-reused
+///   placeholder (`0xB51E0000`) used through Round 14 -- it was never
+///   observed as a broadcast write in this project's own real
+///   capture, so this is the reference's value, not ours.
+async fn initialize_chip_bm1366_chain<W>(
+    chip_count: u8,
+    domain_config: &[DomainConfigWrite],
+    baud_control: Option<&dyn BaudControl>,
+    chip_commands: &mut W,
+    peripherals: &mut BoardPeripherals,
+    asic_difficulty: Log2Difficulty,
+) -> Result<()>
+where
+    W: Sink<protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    use protocol::{Command, Register, RegisterAddress};
+
+    if let Some(ref mut asic_enable) = peripherals.asic_enable {
+        debug!("Enabling ASIC chain");
+        asic_enable
+            .enable()
+            .await
+            .context("failed to enable ASIC chain")?;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    async fn send_broadcast<W>(chip_commands: &mut W, register: Register) -> Result<()>
+    where
+        W: Sink<protocol::Command> + Unpin,
+        W::Error: std::fmt::Debug,
+    {
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register,
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+    }
+
+    debug!("Configuring version mask");
+    for _ in 0..3 {
+        send_broadcast(
+            chip_commands,
+            Register::VersionMask(protocol::VersionMask::full_rolling()),
+        )
+        .await
+        .context("failed to send VersionMask")?;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x00, 0x00]),
+    )
+    .await
+    .context("failed to send InitControl")?;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::MiscControl, &[0xff, 0x0f, 0xc1, 0x00]),
+    )
+    .await
+    .context("failed to send MiscControl")?;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    debug!("Sending ChainInactive");
+    for _ in 0..3 {
+        chip_commands
+            .send(Command::ChainInactive)
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send ChainInactive")?;
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+
+    debug!(chip_count, "Sweeping SetChipAddress");
+    for i in 0..chip_count as u16 {
+        let chip_address = (i * 2) as u8;
+        chip_commands
+            .send(Command::SetChipAddress { chip_address })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send SetChipAddress")?;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Round 9 found *why* Core corrupted communication (Rounds 7/8):
+    // Register::decode always used little-endian, but Core's wire
+    // encoding is big-endian (see protocol.rs's decode fix) -- so
+    // every Core write sent so far was a malformed CORE_MAILBOX
+    // command (see REFERENCE.md's "0x3C - CORE_MAILBOX"), not the
+    // real captured one. Decoding the real captured bytes
+    // big-endian instead matches REFERENCE.md's documented bring-up
+    // values exactly (reg 0x05=0x40 "clock select", reg 0x00=0x20
+    // "clock delay" for BM1366). Restored now that decode is fixed.
+    debug!("Sending broadcast core configuration (CORE_MAILBOX, now correctly big-endian)");
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x85, 0x40]),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x80, 0x20]),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::AnalogMux, &[0x00, 0x00, 0x00, 0x03]),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::decode(RegisterAddress::IoDriverStrength, &[0x02, 0x11, 0x41, 0x11]),
+    )
+    .await?;
+
+    // REFERENCE.md's documented bring-up (BM1370 walkthrough) has a
+    // full "per-chip pass" step: SOFT_RESET_CONTROL (InitControl) and
+    // MISC_CONTROL, both already sent broadcast above, get *repeated
+    // addressed to each chip individually*, immediately before the
+    // CORE_MAILBOX per-chip pass. Round 10 sent this addressed but
+    // reused the broadcast-phase data verbatim, since this board's
+    // real per-chip values were unknown/uncaptured at the time --
+    // that round shipped and tested clean, but still produced zero
+    // Nonce responses.
+    //
+    // Round 12 went back to the original bosminer wire capture
+    // (/tmp/trace.log on the miner, captured in Round 4 via
+    // s19k-trace) and searched it specifically for *addressed*
+    // (non-broadcast) InitControl/MiscControl/Core writes -- a query
+    // never run before, because every earlier pass through that trace
+    // only pulled out the broadcast-phase values. It turns out the
+    // real per-chip values genuinely differ from the broadcast ones
+    // (matching REFERENCE.md's description of the per-chip pass
+    // adding extra "bring-up" bits on top of the broadcast values),
+    // and the real Core triplet order is different from what Round 10
+    // guessed. Confirmed identical across all 77 chip addresses
+    // (0x00..=0x98) on ttyS1 -- these are fixed values applied to
+    // every chip, not per-address-varying data:
+    //   InitControl addressed: 00 07 01 f0  (broadcast was 00 07 00 00)
+    //   MiscControl  addressed: f0 00 c1 00  (broadcast was ff 0f c1 00)
+    //   Core triplet, in this exact real order:
+    //     1. 80 00 80 20  (reg 0x00 clock delay = 0x20)
+    //     2. 80 00 82 aa  (reg 0x02 core enable  = 0xAA)
+    //     3. 80 00 85 40  (reg 0x05 clock select = 0x40)
+    debug!(
+        chip_count,
+        "Sending per-chip InitControl/MiscControl/CORE_MAILBOX pass"
+    );
+    for i in 0..chip_count as u16 {
+        let chip_address = (i * 2) as u8;
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: false,
+                chip_address,
+                register: Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x01, 0xf0]),
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send per-chip InitControl")?;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: false,
+                chip_address,
+                register: Register::decode(RegisterAddress::MiscControl, &[0xf0, 0x00, 0xc1, 0x00]),
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send per-chip MiscControl")?;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        for data in [
+            [0x80u8, 0x00, 0x80, 0x20], // reg 0x00 clock delay = 0x20
+            [0x80, 0x00, 0x82, 0xaa],   // reg 0x02 core enable = 0xAA
+            [0x80, 0x00, 0x85, 0x40],   // reg 0x05 clock select = 0x40
+        ] {
+            chip_commands
+                .send(Command::WriteRegister {
+                    broadcast: false,
+                    chip_address,
+                    register: Register::decode(RegisterAddress::Core, &data),
+                })
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .context("failed to send per-chip CORE_MAILBOX write")?;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    debug!(
+        writes = domain_config.len(),
+        "Sending per-chip domain config writes"
+    );
+    for &(chip_address, register_address, data) in domain_config {
+        let register = Register::decode(register_address, &data);
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: false,
+                chip_address,
+                register,
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send domain config write")?;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Rounds 12-14 (see HANDOFF.md) tried five real hypotheses for why
+    // nothing above ~300MHz produced real hashing (flat temperature,
+    // zero nonces despite clean communication) -- fb_div range, ramp
+    // granularity, VCO stability mid-ramp, settle time, post-divider
+    // preservation -- all ruled out. A real, independently-developed
+    // reference (github.com/Schnitzel/mujina, amlogic-s19kpro-support
+    // branch, with its own real hardware testing on this exact
+    // BHB56902/S19K Pro hashboard) found two real bugs and one real
+    // structural difference:
+    //
+    // 1. BM1366 requires strict `post_div1 > post_div2`, not `>=`.
+    //    Sourced from bitaxeorg/ESP-Miner's real firmware
+    //    (`components/asic/bm1366.c`'s `pll_get_parameters`), not a
+    //    guess -- see `calculate_pll_bm1366` below, which fixes it.
+    //    Every Round 14 hypothesis used `>=`, which allows
+    //    `post_div1 == post_div2` (e.g. 6x6=36) -- an electrically
+    //    invalid combination for this chip family that BM1362/BM1370
+    //    tolerate but BM1366 doesn't.
+    // 2. This exact hashboard's real factory operating voltage is
+    //    13.9V (Braiins' own bosminer log: `Detected hashboard #2:
+    //    Voltage (Avg.) 13.90 V, Frequency (Avg.) 645 MHz`) -- see
+    //    `PSU_TARGET_VOLTS` in `board/antminer_s19k_am3.rs`. Every
+    //    Round 14 test ran at the 15.2V bring-up ceiling instead.
+    // 3. **The frequency ramp runs last**, after TicketMask/NonceRange
+    //    and the baud switch, not before them. Every Round 12-14
+    //    sequence (including this function's own history) ramped
+    //    frequency *then* configured TicketMask/NonceRange -- cores
+    //    would already be enabled and computing at the ramped
+    //    frequency before the registers that control what they report
+    //    (and how) were ever set to their real values.
+    //
+    // TicketMask, NonceRange, and the baud switch now run immediately
+    // after the per-chip pass and domain config, before frequency
+    // ramping -- matching the reference's real, working order.
+    let ticket_mask = TicketMask::new(asic_difficulty);
+    send_broadcast(chip_commands, Register::TicketMask(ticket_mask))
+        .await
+        .context("failed to send TicketMask")?;
+
+    // Real BM1366 value, sourced from the reference's
+    // `chip_config.rs` (`nonce_range: 0x5a10_0000`), not the reused
+    // BM1370 placeholder (`0xB51E0000`) this function used through
+    // Round 14 -- that value got chips searching *something*, but
+    // never a BM1366-real range.
+    send_broadcast(
+        chip_commands,
+        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0x5a10_0000)),
+    )
+    .await
+    .context("failed to send NonceRange")?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Switch to bosminer's real confirmed operating baud (3,125,000),
+    // if the board supports it. Two things have to happen in order:
+    // tell the chips via the real captured UartBaud value first
+    // (0x00003011 -- NOT this module's BaudRate::Baud3M/Baud1M
+    // constants, which were captured from a different chip/board and
+    // don't match this board's real wire bytes), *then* reconfigure
+    // the host tty to match -- reversing the order would leave the
+    // host talking at the old rate to chips already listening at the
+    // new one.
+    if let Some(baud_control) = baud_control {
+        const REAL_UART_BAUD_REGISTER_VALUE: u32 = 0x0000_3011;
+        const REAL_OPERATING_BAUD: u32 = 3_125_000;
+
+        debug!(
+            baud = REAL_OPERATING_BAUD,
+            "Switching to real operating baud"
+        );
+        send_broadcast(
+            chip_commands,
+            Register::UartBaud(protocol::BaudRate::Custom(REAL_UART_BAUD_REGISTER_VALUE)),
+        )
+        .await
+        .context("failed to send UartBaud")?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        baud_control
+            .set_baud_rate(REAL_OPERATING_BAUD)
+            .context("failed to switch host tty to real operating baud")?;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Frequency ramp -- deliberately last. Targets 575MHz: the
+    // reference's own real hardware measurement on this exact chip
+    // family (39.68 TH/s on mujina itself, LuxOS gets 39.15-39.33
+    // TH/s at the same point) -- deliberately not the 645MHz factory
+    // ceiling, which their notes call "right at the edge of
+    // stability" (645MHz measured *less* hashrate than 575MHz).
+    const TARGET_MHZ: f32 = 575.0;
+    const RAMP_STEP_MHZ: f32 = 6.25;
+    const RAMP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut mhz = 56.25f32;
+    loop {
+        mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
+            mhz + RAMP_STEP_MHZ
+        } else {
+            TARGET_MHZ
+        };
+        let pll = calculate_pll_bm1366(mhz)
+            .with_context(|| format!("no valid BM1366 PLL config for {mhz}MHz"))?;
+        send_broadcast(chip_commands, Register::PllDivider(pll))
+            .await
+            .with_context(|| format!("failed to send PllDivider for {mhz}MHz ramp step"))?;
+        tokio::time::sleep(RAMP_STEP_DELAY).await;
+        if mhz >= TARGET_MHZ {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 /// Generate frequency ramp steps for smooth PLL transitions
 fn generate_frequency_ramp_steps(
     start_mhz: f32,
@@ -591,6 +1051,66 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
     ))
 }
 
+/// Calculate a PLL configuration for a target frequency, for BM1366
+/// (this board's real chips, per `ChipId`). Two constraints that
+/// differ from `calculate_pll_for_frequency` above (which backs the
+/// proven Bitaxe/BM1370 path and is left untouched):
+///
+/// - fb_div range `0x90..=0xEB`, not BM1370's `0xA0..=0xEF`
+///   (REFERENCE.md's PLL_DIVIDER section).
+/// - **Strict `post_div1 > post_div2`**, not `>=`. Sourced from
+///   bitaxeorg/ESP-Miner's real firmware (`components/asic/bm1366.c`,
+///   `pll_get_parameters(target, 144, 235, ...)`) via a real,
+///   independently-developed reference for this exact hashboard
+///   (github.com/Schnitzel/mujina, amlogic-s19kpro-support branch) --
+///   this is the bug that made every Round 14 hypothesis fail:
+///   `post_div1 == post_div2` (e.g. 6x6=36) is a real, electrically
+///   invalid combination for this chip family that the non-strict
+///   search happily produced.
+///
+/// Prefers the lowest-VCO valid solution when multiple exist, same
+/// rationale as the reference: keeps the VCO in BM1366's typical
+/// ~2000-2300MHz operating range rather than an arbitrary higher one.
+fn calculate_pll_bm1366(target_freq: f32) -> Option<protocol::PllConfig> {
+    const CRYSTAL_FREQ: f32 = 25.0;
+    const MAX_FREQ_ERROR: f32 = 1.0;
+    const FB_DIV_MIN: u8 = 0x90;
+    const FB_DIV_MAX: u8 = 0xeb;
+
+    let mut best: Option<(u8, u8, u8, u8)> = None;
+    let mut min_error = MAX_FREQ_ERROR;
+    let mut best_vco = f32::MAX;
+
+    for ref_div in [2u8, 1] {
+        for post_div1 in (1u8..=7).rev() {
+            for post_div2 in (1u8..post_div1).rev() {
+                let fb_div_f =
+                    (post_div1 * post_div2) as f32 * target_freq * ref_div as f32 / CRYSTAL_FREQ;
+                let fb_div = fb_div_f.round() as u8;
+                if !(FB_DIV_MIN..=FB_DIV_MAX).contains(&fb_div) {
+                    continue;
+                }
+                let actual_freq =
+                    CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
+                let error = (actual_freq - target_freq).abs();
+                if error > MAX_FREQ_ERROR {
+                    continue;
+                }
+                let vco = fb_div as f32 * CRYSTAL_FREQ / ref_div as f32;
+                if error < min_error || (error <= min_error && vco < best_vco) {
+                    min_error = error.min(min_error);
+                    best_vco = vco;
+                    best = Some((fb_div, ref_div, post_div1, post_div2));
+                }
+            }
+        }
+    }
+
+    let (fb_div, ref_div, post_div1, post_div2) = best?;
+    let post_div = ((post_div1 - 1) << 4) | (post_div2 - 1);
+    Some(protocol::PllConfig::new(fb_div, ref_div, post_div))
+}
+
 /// Internal actor task for BM13xxThread.
 ///
 /// This runs as an independent Tokio task and handles:
@@ -602,6 +1122,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 ///
 /// Chip is disabled on startup to establish known state. Chip is enabled and
 /// configured when scheduler assigns first work.
+#[expect(clippy::too_many_arguments)]
 async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
@@ -610,6 +1131,7 @@ async fn bm13xx_thread_actor<R, W>(
     mut chip_responses: R,
     mut chip_commands: W,
     mut peripherals: BoardPeripherals,
+    init_strategy: ChipInitStrategy,
 ) where
     R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
     W: Sink<protocol::Command> + Unpin,
@@ -680,7 +1202,7 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
+                            if let Err(e) = initialize_chip(&init_strategy, &mut chip_commands, &mut peripherals, asic_difficulty).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -730,7 +1252,7 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
+                            if let Err(e) = initialize_chip(&init_strategy, &mut chip_commands, &mut peripherals, asic_difficulty).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;

@@ -7,11 +7,13 @@
 
 use anyhow::Result;
 
+pub mod antminer_s19k_am3;
 pub mod cpu;
 pub mod serial;
 pub mod usb;
 
 // Re-export transport implementations
+pub use antminer_s19k_am3::DeviceInfo as AntminerS19kAm3DeviceInfo;
 pub use cpu::CpuDeviceInfo;
 pub use serial::{
     Parity, SerialConfig, SerialControl, SerialError, SerialReader, SerialStats, SerialStream,
@@ -27,6 +29,9 @@ pub enum TransportEvent {
 
     /// CPU miner virtual device event
     Cpu(cpu::TransportEvent),
+
+    /// Antminer S19K Pro (AM3/Amlogic) virtual device event
+    AntminerS19kAm3(antminer_s19k_am3::TransportEvent),
 
     /// The transport finished its initial device scan.
     ///

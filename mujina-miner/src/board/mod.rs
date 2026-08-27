@@ -1,3 +1,4 @@
+pub(crate) mod antminer_s19k_am3;
 pub(crate) mod bitaxe;
 pub(crate) mod cpu;
 pub(crate) mod emberone00;
