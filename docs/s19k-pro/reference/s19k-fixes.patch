@@ -1,3 +1,60 @@
+From: Antminer S19K Pro bring-up, github.com/tronsington/mujina
+Subject: [PATCH] S19K Pro: Core byte order, NonceRange revert, bit-bang PSU
+
+PROVENANCE
+==========
+
+This patch modifies code belonging to another project. It is NOT a
+patch against this repository.
+
+  Upstream:  https://github.com/Schnitzel/mujina
+  Branch:    amlogic-s19kpro-support
+  Applies to: 9837ef71a6e82639e336830ddeae5cb530965eb9
+              ("S19k Pro Amlogic: bring up all present hashboards in
+               parallel")
+  Licence:   GPL-3.0-or-later, the same as this repository, so it is
+             redistributable here with attribution.
+
+  To use it:
+      git clone --branch amlogic-s19kpro-support --single-branch \
+          https://github.com/Schnitzel/mujina.git schnitzel-mujina
+      cd schnitzel-mujina
+      git checkout 9837ef7
+      git apply /path/to/s19k-fixes.patch
+
+WHAT IT CHANGES, AND WHOSE WORK IT IS
+=====================================
+
+The surrounding S19K Pro port --- the board driver, the chip config
+table, the bring-up sequencing --- is Schnitzel's work. This patch is
+five files of changes on top of it:
+
+  chip_config.rs   BM1366's `Core` (0x3C, CORE_MAILBOX) values were
+                   stored byte-reversed, so the chips received bit 31
+                   clear and "apply to all cores" never took effect.
+                   Stored big-endian now, matching bm1362()/bm1370().
+                   The guarding unit test asserted the wrong byte order
+                   and is corrected too --- which is why CI stayed green
+                   over the bug.
+  sequencer.rs     revert NonceRange to the captured BM1366 value
+  board/mod.rs     wire up the PSU shim below
+  psu_bitbang_i2c.rs (new)
+                   this unit's PSU is not reachable through any
+                   /dev/i2c-N device --- it answers only on bit-banged
+                   GPIO 476/477. Without this the port cannot power the
+                   board at all.
+  s19k_pro_amlogic.rs
+                   use the shim, and default fans to 100%
+
+Applying it took that fork from ~2.9 TH/s to ~105 TH/s on real
+hardware, verified against the pool's own accounting. Full analysis:
+docs/s19k-pro/root-cause.md. Licensing detail: docs/s19k-pro/ATTRIBUTION.md.
+
+Note that `chip_config.rs` exists only in that fork; neither this
+repository nor upstream 256foundation/mujina has that file, so this is
+their bug and their fix, not an upstream one.
+
+---
 diff --git a/mujina-miner/src/asic/bm13xx/chip_config.rs b/mujina-miner/src/asic/bm13xx/chip_config.rs
 index 4fbaead..92600c6 100644
 --- a/mujina-miner/src/asic/bm13xx/chip_config.rs

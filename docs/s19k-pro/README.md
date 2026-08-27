@@ -73,8 +73,9 @@ doing almost no useful work with it.
 |---|---|
 | [reference/full-engineering-log.md](reference/full-engineering-log.md) | The complete unedited working log, ~2,250 lines, written as work happened. The narrative docs above are distilled from this. Includes exact wire bytes, captured sequences, and reasoning at the time. |
 | [reference/recon-methodology.md](reference/recon-methodology.md) | The original hardware recon session — how the hardware map was derived, and the safe-vs-risky reasoning for poking at a live miner. Some conclusions superseded; the methodology holds. |
-| [reference/s19k-fixes.patch](reference/s19k-fixes.patch) | The fix as applied to the community S19K Pro fork (see below), self-contained across 5 files. |
-| [reference/mujina-s19k-real.toml](reference/mujina-s19k-real.toml) | Working board config for this unit — chain/UART/GPIO mapping, PSU, fans. |
+| [reference/s19k-fixes.patch](reference/s19k-fixes.patch) | The fix as applied to the community S19K Pro fork (see below), self-contained across 5 files. Its header records the upstream repo, branch, base commit and licence — it patches *their* code, not this repository's. |
+| [reference/mujina-s19k-real.toml](reference/mujina-s19k-real.toml) | Board config for this unit — chain/UART/GPIO mapping, PSU, fans. Note this is the **reference port's** config format; this repository's driver holds the same mapping as compile-time constants. |
+| [ATTRIBUTION.md](ATTRIBUTION.md) | What came from whose project, under what licence, and where it landed. Read before lifting code from, or redistributing, any of this. |
 
 ## Two codebases, and which one is proven
 
