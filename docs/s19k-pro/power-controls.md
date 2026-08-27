@@ -249,7 +249,8 @@ where the interesting work starts. Do not build step 5 first.
 
 ## Code locations
 
-Reference port (`~/mujina-s19kpro-ref/schnitzel-mujina/mujina-miner/src/`):
+Reference port ([Schnitzel/mujina](https://github.com/Schnitzel/mujina),
+branch `amlogic-s19kpro-support`, under `mujina-miner/src/`):
 
 | What | Where |
 |---|---|
@@ -279,8 +280,14 @@ This repo:
 - PSU enable: GPIO 437, active-low (`1` = disabled)
 - 6 × TMP75 board sensors on `/dev/i2c-1`, (inlet, outlet) per board
 - 4 fan channels on 2 PWM channels: fans 0&1 → `pwm0`, fans 2&3 →
-  `pwm1`. Fan 3 has always read 0 RPM — believed unpopulated,
-  **physically unconfirmed**
+  `pwm1`. Fan 3 reads 0 RPM. Stock `bosminer` read it as 0 as well
+  (`fan_rpm_feedback{idx="3"} 0` in its own metrics while 0/1/2 ran
+  ~6,000 RPM), so this is a **pre-existing hardware fault, not
+  something Mujina's fan control causes** — and not a dead PWM
+  channel, since `pwm1` also drives fan 2, which spins. Whether the
+  fan is stopped or only its tachometer is unread is unconfirmed;
+  both stacks read the tach through the same path. Treat the unit as
+  running on three of four fans when judging thermal headroom
 - PWM: `configure_percent(period, percent, enable)`, polarity `normal`,
   duty scales linearly with percent, sense confirmed not inverted
   (50% → ~4.2–5.4k RPM, 100% → ~6.3–7.9k RPM)
@@ -350,7 +357,7 @@ true ceiling, not the 75 °C cutoff.
 
 ## Supporting tooling already built
 
-- **Dashboard aggregator** at `~/miner-dashboard/` (not in this repo) —
+- **Dashboard aggregator** at [`tools/miner-dashboard/`](../../tools/miner-dashboard/) —
   polls mujina's API, the pool API, and HashScope; keeps ~2 h of
   history; serves `/` (plain), `/mmbn` (themed), `/builtin` (mujina's
   own, proxied), `/api/state` (JSON). Natural home for plug wattage,
@@ -358,12 +365,14 @@ true ceiling, not the 75 °C cutoff.
 - **Note:** mujina's API binds `127.0.0.1` by default and the miner's
   firewall is `INPUT policy DROP` with an allowlist excluding 7785, so
   reaching it from the LAN needs either `MUJINA_API_LISTEN=0.0.0.0:7785`
-  plus a firewall rule, or an SSH tunnel (`~/miner-dashboard/tunnel.sh`).
+  plus a firewall rule, or an SSH tunnel
+  ([`tools/miner-dashboard/tunnel.sh`](../../tools/miner-dashboard/tunnel.sh)).
 - **HashScope** stratum MITM proxy for per-submit accept/reject.
-- **Supervisor** — `reference/mujina-supervisor.sh`, which keeps
+- **Supervisor** — [`tools/miner-supervisor/mujina-supervisor.sh`](../../tools/miner-supervisor/mujina-supervisor.sh), which keeps
   mujina running unattended with a clean PSU cycle between attempts,
   crash-loop backoff, and a `bosminer` fallback. Needed for the long
   unattended runs that characterisation and tuning will require. See
   [running-it.md](running-it.md#unattended-operation).
-- **`~/mujina-s19kpro-ref/s19k-fixes.patch`** — the fixes that made the
-  reference port reach ~105 TH/s on this hardware.
+- **[`reference/s19k-fixes.patch`](reference/s19k-fixes.patch)** — the
+  fixes that made the reference port reach ~105 TH/s on this hardware.
+  See [ATTRIBUTION.md](ATTRIBUTION.md) before redistributing it.

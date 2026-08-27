@@ -112,7 +112,7 @@ handler, it leaves the **PSU still enabled** with the chips idle. That
 is thermally harmless (fans hold their last PWM duty) but it silently
 stops mining, which matters for overnight soaks and long tuning runs.
 
-[`reference/mujina-supervisor.sh`](reference/mujina-supervisor.sh) is a
+[`tools/miner-supervisor/mujina-supervisor.sh`](../../tools/miner-supervisor/mujina-supervisor.sh) is a
 minimal supervisor for this. Set the env block at the top, then:
 
 ```sh
