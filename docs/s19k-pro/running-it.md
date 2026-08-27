@@ -64,30 +64,131 @@ done; done
 
 ## Running
 
-Stop the stock daemon first — it holds the UARTs and PSU:
+Two different binaries get run on this hardware, and they are
+configured differently. Confusing them is the most common way to get a
+daemon that starts cleanly and never touches the hashboards.
+
+- **This repository's `mujina-minerd`** — what the rest of this
+  document means by "Mujina". Configured entirely by environment
+  variables.
+- **The reference port's binary** — [Schnitzel/mujina](https://github.com/Schnitzel/mujina)'s
+  `amlogic-s19kpro-support` branch, which is where ~105 TH/s was
+  demonstrated. Configured by a TOML file. See
+  [Reproducing the 105 TH/s result](#reproducing-the-105-ths-result)
+  at the end.
+
+Either way, stop the stock daemon first — it holds the UARTs and PSU:
 
 ```sh
 /etc/init.d/S99bosminer stop     # takes ~20s
 ```
 
-Then:
+### Running this repository's daemon
 
 ```sh
-MUJINA_CONFIG=/tmp/mujina-s19k-real.toml \
-MUJINA_POOL_URL='stratum+tcp://<pool>:3333' \
-MUJINA_POOL_USER='<worker>' \
+MUJINA_ANTMINER_S19K_AM3_ENABLE=1 \
+MUJINA_POOL_URL='stratum+tcp://pool.256foundation.org:3333' \
+MUJINA_POOL_USER='<your-npub>.<worker>' \
+MUJINA_API_LISTEN=0.0.0.0:7785 \
 RUST_LOG='info,mujina_miner::asic::bm13xx=debug' \
 /tmp/mujina-minerd
 ```
 
-Board config: [reference/mujina-s19k-real.toml](reference/mujina-s19k-real.toml).
-The mapping that matters for this unit — chains 0/1/2 →
-`/dev/ttyS1`/`ttyS2`/`ttyS3`, `reset_gpio` 454/455/456, `detect_gpio`
-439/440/441, PSU `enable_gpio` 437, temp/EEPROM on `/dev/i2c-1`.
+**`MUJINA_ANTMINER_S19K_AM3_ENABLE` is not optional.** This board is
+not discovered from hardware — it *is* the host control board — so it
+registers as a `VirtualBoardDescriptor` and stays inert unless that
+variable is set. Without it the daemon starts, serves its API, connects
+to the pool, and never drives a single chip.
 
-**Set `default_fan_percent = 100`.** There is no dynamic fan control;
-the value is applied once at startup and never revisited. At 50% the
-board hits the overtemp cutoff in about four minutes under load.
+`mujina-minerd --help` lists every control variable.
+
+**What a healthy start looks like**, and how far it currently gets:
+
+```
+INFO daemon: Antminer S19K Pro (AM3) enabled
+INFO board::antminer_s19k_am3: Hashboard presence detect presence=[true, true, true]
+WARN board::antminer_s19k_am3: PSU set_voltage failed, retrying   <- normal, bit-banged bus
+DEBUG asic::bm13xx::thread: Sweeping SetChipAddress
+DEBUG asic::bm13xx::thread: Sending broadcast core configuration (CORE_MAILBOX, now correctly big-endian)
+DEBUG asic::bm13xx::thread: Sending per-chip InitControl/MiscControl/CORE_MAILBOX pass
+DEBUG asic::bm13xx::thread: Switching to real operating baud baud=3125000
+   ... chain=1/2/3, chips=77 each
+```
+
+`GET /api/v0/miner` then reports six temperature sensors, PSU voltage,
+and the pool source with its assigned difficulty.
+
+**Expect it to stop there for now.** On a fresh build (checked
+2026-08-27) the sequence completes, all 231 chips enumerate, the
+frequency ramp runs to its 575 MHz target, the pool connects — and no
+nonces follow, with board temperature flat at ambient.
+
+This is the retest the earlier notes kept calling for, and the result
+is negative: **the `Core` byte-order fix is present in this driver and
+is not on its own enough to make it hash at 575 MHz.** Whatever else
+the reference port does differently has not been identified. Round 12
+did mine real accepted shares with this driver and Round 14 reached
+~4-6 TH/s at ~300 MHz, so the path is not hypothetical — but it is not
+reproducible from a fresh build today.
+
+If you want the ~105 TH/s result now, use the reference port — see
+[Reproducing the 105 TH/s result](#reproducing-the-105-ths-result).
+
+A flat temperature is the diagnostic worth internalising: chips that
+are powered but not hashing sit at ambient. Rising temperature is the
+first real sign of work, well before any hashrate figure is
+trustworthy.
+
+> **`MUJINA_CONFIG` does nothing in this repository.** `Config::load`
+> and `Config::load_from` are unimplemented upstream stubs and are
+> never called, so passing a TOML file is silently ignored. That
+> variable belongs to the reference port. This repository's board
+> mapping lives in compile-time constants in
+> `mujina-miner/src/board/antminer_s19k_am3.rs`: `CHAIN_TTYS`,
+> `CHAIN_ENABLE_OFFSETS`, `CHAIN_PRESENCE_OFFSETS`, `PSU_NEN_OFFSET`,
+> `PSU_SCL_GPIO`/`PSU_SDA_GPIO`, `PSU_TARGET_VOLTS`,
+> `TEMP_SENSOR_ADDRS`. Changing the mapping means editing those and
+> rebuilding.
+
+The mapping those constants encode, for this unit: chains 1/2/3 →
+`/dev/ttyS1`/`ttyS2`/`ttyS3`, enable GPIO 454/455/456, presence GPIO
+439/440/441, PSU enable GPIO 437 (active low), PSU I2C bit-banged on
+GPIO 476/477, temperature sensors on `/dev/i2c-1`. Full detail in
+[hardware.md](hardware.md) and
+[../../mujina-miner/src/board/antminer_s19k_am3.md](../../mujina-miner/src/board/antminer_s19k_am3.md).
+
+### Fans: set them yourself before you start this daemon
+
+> **This repository's driver does not touch the fans at all.** It has
+> no fan control, no fan telemetry, and **no overtemp gate** — it reads
+> the six board sensors for telemetry only and will not stop on
+> temperature. The 75 °C cutoff described elsewhere in these docs is
+> the *reference port's* software gate. Nothing in this binary protects
+> the board.
+
+That matters because the fans do not reliably keep spinning between
+runs. `bosminer` and the reference port both zero the PWM duty on a
+clean shutdown, so after stopping either one you can be left at
+`duty_cycle = 0` — no airflow — and this daemon will happily power 231
+chips into it.
+
+**Check, and set to 100%, before every start:**
+
+```sh
+for c in /sys/class/pwm/pwmchip0/pwm0 /sys/class/pwm/pwmchip0/pwm1; do
+    cat "$c/period" > "$c/duty_cycle"      # duty = period = 100%
+    echo 1 > "$c/enable"
+done
+grep . /sys/class/pwm/pwmchip0/pwm*/duty_cycle   # expect 10000 twice
+```
+
+Two PWM channels drive four fans (0&1 on `pwm0`, 2&3 on `pwm1`), and
+this daemon leaves whatever it finds untouched — so whatever you set
+persists for the whole run, and after it exits.
+
+**Never disable the fans** — not as a test, not briefly. At 50% this
+board reaches the overtemp cutoff in about four minutes under load.
+
 
 ### Shutdown
 
@@ -247,7 +348,7 @@ proxy.
 
 Split your rejects by time before concluding anything.
 
-## Applying the fix to the reference port
+## Reproducing the 105 TH/s result
 
 The ~105 TH/s result was demonstrated on
 [Schnitzel/mujina](https://github.com/Schnitzel/mujina)'s
