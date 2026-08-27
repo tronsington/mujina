@@ -1762,8 +1762,9 @@ installs (`Seccomp: 2`), but nothing ever traps. Root cause not
 found -- possibly a real quirk of this board's old (4.9.113), heavily
 vendor-customized aarch64 kernel running these chips' driver as a
 32-bit ARM EABI compat process. Shelved rather than sunk further time
-into it; `s19k_trace_fast.rs` is left in the tree in its current
-(non-working, but instructive) state for whoever picks this up next.
+into it. `s19k_trace_fast.rs` was later removed from the tree rather
+than shipped in a known-non-working state; it is preserved in git
+history at commit `398072d` for whoever picks this up next.
 
 **Net result**: six real, well-reasoned, individually-tested
 hypotheses (formula-computed PLL choice at two different search
