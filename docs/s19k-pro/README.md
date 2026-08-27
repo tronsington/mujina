@@ -105,9 +105,15 @@ own driver is still open. See [running-it.md](running-it.md).
 
 ## Known-open items
 
-- Port the `Core` fix into this repo's driver and retest at 575 MHz.
-  Round 15 proves the hardware gets there, so any shortfall is now a
-  driver bug rather than a hardware limit.
+- **Find what else the reference port does differently.** The `Core`
+  fix is in this repo's driver, and it was retested on real hardware at
+  575 MHz on 2026-08-27: full bring-up, 231/231 chips, ramp to target,
+  pool connected — and zero nonces, board flat at ambient. So the fix
+  alone is not sufficient here. Round 15 proves the hardware reaches
+  ~105 TH/s, so this remains a driver bug rather than a hardware limit,
+  but the specific difference is still unidentified. Diffing this
+  driver's wire output against the reference's, on the same hardware,
+  is the obvious next move.
 - Longer soak testing. ~45 minutes is clean and thermally flat; hours
   are untested (memory growth, pool reconnect, chip-count drift).
 - Frequency headroom above 575 MHz is unexplored. The EEPROM ATE

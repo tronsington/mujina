@@ -27,8 +27,14 @@ Without that variable the driver never runs.
 
 ## Status
 
-**Mining, with real accepted shares.** Confirmed stable at ~300 MHz for
-roughly 4-6 TH/s.
+**Brings the board up fully; does not currently hash out of the box.**
+
+A fresh build on real hardware (2026-08-27) powers the PSU, enumerates
+**77/77 chips on all three chains**, runs the full per-chip bring-up,
+switches to 3.125 Mbaud, connects to the pool, and serves telemetry ---
+then produces no nonces, with board temperature flat at ambient. This
+driver did mine real accepted shares in Round 12 and reached ~4-6 TH/s
+at ~300 MHz in Round 14; reproducing that is an open task.
 
 The hardware is proven to reach **~105-115 TH/s at 575 MHz** with a 0%
 reject rate at settled pool difficulty -- but that was measured against

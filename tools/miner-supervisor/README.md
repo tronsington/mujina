@@ -28,8 +28,13 @@ It does three things a naive `while true` loop does not:
 3. **Falls back to `bosminer`** after five consecutive short runs, so
    the machine keeps mining even if Mujina is unstable.
 
-Fans are unaffected throughout: PWM duty persists in hardware, so they
-stay where they were (100%) even while Mujina is down.
+**Set the fans to 100% before starting this**, and verify it. This
+repository's `mujina-minerd` never touches the PWM, so whatever duty is
+set persists across restarts and after it exits — but `bosminer` and the
+reference port both zero the duty on a clean shutdown, so you may be
+starting from no airflow. The daemon has no overtemp gate of its own.
+See [docs/s19k-pro/running-it.md](../../docs/s19k-pro/running-it.md),
+"Fans: set them yourself".
 
 ## Two traps on this hardware
 

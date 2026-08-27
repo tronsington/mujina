@@ -17,21 +17,36 @@
 #     MAX_FAILS consecutive failures we stop and hand back to bosminer
 #     so the machine keeps mining regardless.
 #
-# Fans are unaffected throughout: PWM duty persists in hardware, so they
-# stay where they were (100%) even while mujina is down.
+# Fans: this repository's mujina-minerd never touches the PWM, so
+# whatever duty you set before starting the supervisor persists across
+# every restart and after it exits. Set it to 100% first -- see
+# docs/s19k-pro/running-it.md, "Fans: set them yourself".
+#
+# Do NOT assume that holds generally. bosminer and the reference port
+# both zero the PWM duty on a clean shutdown, so if either of those ran
+# last you may be starting from no airflow at all.
 
-BIN=/tmp/mujina-minerd-corefix
+BIN=/tmp/mujina-minerd
 PSU_GPIO=/sys/class/gpio/gpio437/value      # active-low: 1 = disabled
 LOG=/tmp/mujina.log
 SUPLOG=/tmp/mujina-supervisor.log
 MIN_GOOD_RUN=120                            # seconds; shorter = a failure
 MAX_FAILS=5
 
-export MUJINA_CONFIG=/tmp/mujina-s19k-real.toml
+# Configuration for this repository's mujina-minerd. Without
+# MUJINA_ANTMINER_S19K_AM3_ENABLE the daemon starts, serves its API,
+# connects to the pool, and never drives a chip -- this board is not
+# discovered from hardware, it *is* the host control board.
+export MUJINA_ANTMINER_S19K_AM3_ENABLE=1
 export MUJINA_API_LISTEN=0.0.0.0:7785
-export MUJINA_POOL_URL='stratum+tcp://<pool-or-proxy-host>:3333'
-export MUJINA_POOL_USER='<your-worker>.mujina_s19k_pro'
+export MUJINA_POOL_URL='stratum+tcp://pool.256foundation.org:3333'
+export MUJINA_POOL_USER='<your-npub>.<worker>'
 export RUST_LOG='info,mujina_miner::asic::bm13xx=info'
+
+# Driving the reference port instead? Point BIN at its binary and
+# swap the line above for MUJINA_CONFIG=/tmp/mujina-s19k-real.toml --
+# that variable does nothing in this repository. See
+# docs/s19k-pro/running-it.md.
 
 log() { echo "$(date +%Y-%m-%dT%H:%M:%S) $*" >> "$SUPLOG"; }
 

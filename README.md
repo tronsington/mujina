@@ -25,9 +25,11 @@ starting point:
 - **[Antminer S19K Pro](mujina-miner/src/board/antminer_s19k_am3.md)**
   (231 BM1366 ASICs across three hashboards, Amlogic A113D "AM3"
   control board): a ~2 kW production miner, running Mujina in place of
-  stock BraiinsOS+ `bosminer`. Mining real accepted shares; the
-  hardware is proven to ~105-115 TH/s. Full documentation, including
-  the complete bring-up log and every dead end, is in
+  stock BraiinsOS+ `bosminer`. Brings the board up fully and
+  enumerates all 231 chips; has mined real accepted shares, though
+  reproducing that from a fresh build is an open task. The hardware is
+  proven to ~105-115 TH/s. Full documentation, including the complete
+  bring-up log and every dead end, is in
   [docs/s19k-pro/](docs/s19k-pro/).
 - **[Bitaxe Gamma](mujina-miner/src/board/bitaxe_gamma.md)** (single
   BM1370 ASIC): an open-source single-chip miner. Good for developers

@@ -584,12 +584,23 @@ where
 /// comment has the full rationale for why this is a separate function
 /// rather than a shared parameterized one).
 ///
-/// **This sequence mines.** Real `Nonce` responses decode and the pool
-/// accepts real shares (bring-up log, Round 12), and it is confirmed
-/// thermally and electrically stable at ~300 MHz for roughly 4-6 TH/s
-/// (Round 14).
+/// **This sequence has mined, but does not out of the box today.**
+/// Real `Nonce` responses decoded and the pool accepted real shares in
+/// Round 12, and Round 14 confirmed ~4-6 TH/s at ~300 MHz. A fresh
+/// build run on real hardware on 2026-08-27 completed the whole
+/// sequence below --- all 231 chips addressed, per-chip pass sent,
+/// baud switched, chains enabled, the ramp below run to its 575 MHz
+/// target, pool connected --- and then produced **zero nonces in five
+/// minutes, with board temperature flat at ambient**.
 ///
-/// What is *not* yet established for this driver is frequency headroom.
+/// That is the retest the notes had been calling for, and it came back
+/// negative: the `Core` byte-order fix is present in this crate and is
+/// **not on its own sufficient** to make this driver hash at 575 MHz.
+/// The signature is the one Round 14 recorded for every frequency above
+/// 300 MHz. Whatever else the reference port does differently has not
+/// been identified yet.
+///
+/// What is *not* established for this driver is frequency headroom.
 /// Every frequency above ~300 MHz failed identically here -- flat
 /// temperature, zero nonces -- and Round 15 found why: a byte-order bug
 /// on the `Core` register left `CORE_MAILBOX`'s "apply to all cores"
@@ -925,6 +936,11 @@ where
     const RAMP_STEP_MHZ: f32 = 6.25;
     const RAMP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+    debug!(
+        target_mhz = TARGET_MHZ,
+        step_mhz = RAMP_STEP_MHZ,
+        "Ramping frequency"
+    );
     let mut mhz = 56.25f32;
     loop {
         mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
@@ -942,6 +958,7 @@ where
             break;
         }
     }
+    debug!(mhz, "Frequency ramp complete");
 
     Ok(())
 }
