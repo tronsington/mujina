@@ -10,7 +10,7 @@
 //! Usage: s19k-probe <chain 1|2|3> [baud]
 //!
 //! Chain -> GPIO enable line (periphs-banks controller, base 411) and
-//! UART device, per s19k-pro-am3-hardware-notes.md:
+//! UART device, per `docs/s19k-pro/hardware.md`:
 //!   chain 1: GPIO 454, /dev/ttyS1
 //!   chain 2: GPIO 455, /dev/ttyS2
 //!   chain 3: GPIO 456, /dev/ttyS3
@@ -50,8 +50,9 @@ const EXPECTED_CHIPS: usize = 77;
 
 /// Per-chip addressed IoDriverStrength (register 0x58) / UartRelay
 /// (register 0x2C) writes, captured verbatim from a real successful
-/// bring-up (chain 3) via the `s19k-trace` ptrace tracer -- see
-/// HANDOFF.md's "Round 4". Only a subset of chips (roughly every 7th
+/// bring-up (chain 3) via the `s19k-trace` ptrace tracer -- see the
+/// engineering log (`docs/s19k-pro/reference/full-engineering-log.md`),
+/// "Round 4". Only a subset of chips (roughly every 7th
 /// address) get written directly; UartRelay's own doc comment calls
 /// it "domain relay configuration", so this is very likely
 /// per-domain-boundary chip config that propagates internally to the
@@ -177,7 +178,8 @@ async fn main() -> anyhow::Result<()> {
     let mut data_writer = FramedWrite::new(writer, bm13xx::FrameCodec);
 
     // Real captured sequence from bosminer's own successful bring-up
-    // (via a ptrace syscall tracer -- see HANDOFF.md's "Round 4").
+    // (via a ptrace syscall tracer -- see the engineering log's
+    // "Round 4").
     // Every earlier attempt sent VersionMask then discover_chips() in
     // isolation and got zero responses. The real firmware sends
     // discover LAST, after every chip has already been individually
@@ -268,7 +270,8 @@ async fn main() -> anyhow::Result<()> {
     let (chips, total_bytes) = read_responses(&mut reader, Duration::from_millis(2000)).await?;
     report(chain, "initial discovery", &chips, total_bytes);
 
-    // HANDOFF.md's Round 7/8: real hardware testing found chips accept
+    // The engineering log's Round 7/8: real hardware testing found
+    // chips accept
     // jobs but never return a single Nonce. A first pass sending the
     // *whole* post-discovery config sequence then re-discovering
     // found a real regression (77 -> 54 chips, and a flood of garbled

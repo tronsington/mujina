@@ -8,21 +8,29 @@
 //! instead of a tunneled management protocol.
 //!
 //! Full hardware map, GPIO/I2C addresses, and how each was confirmed:
-//! `s19k-pro-am3-hardware-notes.md` in the recon docs.
+//! `docs/s19k-pro/hardware.md`. Build, deploy and run steps:
+//! `docs/s19k-pro/running-it.md`. Enable this board with
+//! `MUJINA_ANTMINER_S19K_AM3_ENABLE` -- it is not discovered from
+//! hardware, it *is* the host control board.
 //!
-//! **Chip discovery works, real hash threads are wired up, and jobs
-//! dispatch correctly to real hardware -- but real chip hashing isn't
-//! confirmed yet** (see `HANDOFF.md`'s "Round 5" through "Round 8").
-//! The chips actually self-report as BM1366, not BM1362 as assumed
-//! earlier in the investigation. This driver powers the PSU, resets
-//! all three chains together (a real hardware requirement found in
-//! Round 5: a single chain enabled alone never responds, even at
-//! correct voltage), and creates one `BM13xxThread` per chain using a
-//! chain-shaped `ChipInitStrategy::Bm1366Chain` (see
-//! `asic/bm13xx/thread.rs`) that replays the real captured bring-up
-//! sequence, including a real (as of Round 8, untested-but-plausible)
-//! switch to `bosminer`'s real 3.125Mbaud operating speed. See that
-//! strategy's doc comment for the remaining specific known gaps.
+//! **This driver mines.** Chips are discovered and addressed, real
+//! hash threads run, and the pool accepts real shares, confirmed
+//! stable at ~300 MHz for roughly 4-6 TH/s. Frequency headroom above
+//! that is the open question -- see
+//! `ChipInitStrategy::Bm1366Chain`'s doc comment in
+//! `asic/bm13xx/thread.rs` for exactly what is and is not established.
+//! The round-by-round account, including every dead end, is
+//! `docs/s19k-pro/bring-up-log.md`; the unedited log with all wire
+//! bytes is `docs/s19k-pro/reference/full-engineering-log.md`.
+//!
+//! The chips self-report as BM1366, not BM1362 as assumed earlier in
+//! the investigation. This driver powers the PSU, resets all three
+//! chains together (a real hardware requirement found in Round 5: a
+//! single chain enabled alone never responds, even at correct
+//! voltage), and creates one `BM13xxThread` per chain using a
+//! chain-shaped `ChipInitStrategy::Bm1366Chain` that replays the real
+//! captured bring-up sequence, including the switch to `bosminer`'s
+//! real 3.125 Mbaud operating speed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,12 +85,15 @@ const CHAIN_ENABLE_OFFSETS: [u8; 3] = [43, 44, 45];
 const CHAIN_PRESENCE_OFFSETS: [u8; 3] = [28, 29, 30];
 
 /// Per-chain data UARTs, confirmed via a ptrace capture of a real
-/// `bosminer` bring-up (HANDOFF.md's "Round 4") and cross-checked
+/// `bosminer` bring-up (the engineering log's "Round 4", in
+/// `docs/s19k-pro/reference/full-engineering-log.md`) and
+/// cross-checked
 /// live against each chain's own `/proc/<pid>/fd` -- not `ttyS0`, and
 /// not a naive "chain N -> ttySN" assumption taken on faith.
 const CHAIN_TTYS: [&str; 3] = ["/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"];
 
-/// Confirmed real power-on/discovery baud (HANDOFF.md's "Round 5" --
+/// Confirmed real power-on/discovery baud (the engineering log's
+/// "Round 5" --
 /// verified directly via `TCSETS` ioctl decoding, not assumed).
 const CHAIN_BAUD: u32 = 115_200;
 
@@ -125,13 +136,15 @@ pub(crate) const EXPECTED_CHIPS: usize = 77;
 
 /// Per-chip addressed `IoDriverStrength`(`0x58`)/`UartRelay`(`0x2C`)
 /// writes, captured verbatim from a real successful bring-up (chain
-/// 3) via the `s19k-trace` ptrace tracer -- see HANDOFF.md's "Round
-/// 4"/"Round 5". Only a subset of chips (roughly every 7th address)
+/// 3) via the `s19k-trace` ptrace tracer -- see the engineering log's
+/// "Round 4"/"Round 5". Only a subset of chips (roughly every 7th
+/// address)
 /// get them directly; `UartRelay`'s own doc comment calls it "domain
 /// relay configuration", so this is very likely per-domain-boundary
 /// config that propagates internally to the rest of each domain, not
 /// a per-chip requirement -- but the exact semantics aren't
-/// understood yet (see HANDOFF.md's Next Steps), so this replays the
+/// understood yet (see the engineering log's remaining-gaps section),
+/// so this replays the
 /// real bytes rather than guessing which subset/values matter.
 /// (chip_address, register_address, raw wire data bytes). Kept in
 /// sync with (not shared code with) the identical table in
@@ -455,7 +468,8 @@ async fn power_up_and_validate(
 
 /// Gradually move PSU output voltage to `target`, stepping in either
 /// direction, matching `bosminer`'s own observed ramp behavior
-/// (HANDOFF.md's "Round 3" and "Round 14") rather than jumping
+/// (the engineering log's "Round 3" and "Round 14") rather than
+/// jumping
 /// straight to a setpoint on a rail that may not have been driven in
 /// a while.
 ///
@@ -488,7 +502,8 @@ async fn ramp_psu_voltage(psu: &mut Apw12<BitBangI2c>, target: f32) -> Result<()
 ///
 /// The bit-banged PSU bus is a real software I2C implementation over
 /// two GPIO lines with no hardware framing/clock-stretching support --
-/// HANDOFF.md's PSU section already documents occasional flakiness
+/// `docs/s19k-pro/hardware.md`'s PSU section already documents
+/// occasional flakiness
 /// (voltage readings that bounce, attributed to bit-bang timing noise
 /// under real system load). A single `set_voltage` from a fresh CLI
 /// process is reliable, but a longer in-process ramp (many
@@ -516,7 +531,8 @@ async fn set_voltage_with_retries(psu: &mut Apw12<BitBangI2c>, volts: f32) -> Re
     unreachable!("loop always returns on the final attempt")
 }
 
-/// Run the corrected chip discovery sequence (HANDOFF.md's "Round 5")
+/// Run the corrected chip discovery sequence (the engineering log's
+/// "Round 5")
 /// on one chain's UART and return the chips that responded.
 ///
 /// Real captured sequence: VersionMask x3 -> InitControl -> MiscControl

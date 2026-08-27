@@ -12,7 +12,7 @@
 //! Protocol reverse-engineered from skot/amlogic-cb-tools'
 //! `apw12-psu-tool` (not part of Mujina); this port and the DAC/ADC
 //! calibration constants come from there. See
-//! `s19k-pro-am3-hardware-notes.md` in the recon docs for the
+//! `docs/s19k-pro/hardware.md`'s "PSU communication" section for the
 //! full protocol writeup and how the address/register were confirmed
 //! against real APW12 firmware.
 
