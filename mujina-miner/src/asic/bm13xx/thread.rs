@@ -206,17 +206,21 @@ pub enum ChipInitStrategy {
     /// (Antminer S19K Pro AM3-style boards). Addresses every chip via
     /// a `SetChipAddress` sweep before configuring, then replays
     /// `domain_config` verbatim (semantics not fully understood yet --
-    /// see HANDOFF.md's Round 5/6 -- so captured real bytes are used
-    /// rather than a guessed-at general rule).
+    /// see the engineering log
+    /// (`docs/s19k-pro/reference/full-engineering-log.md`), Round 5/6
+    /// -- so captured real bytes are used rather than a guessed-at
+    /// general rule).
     Bm1366Chain {
         chip_count: u8,
         domain_config: &'static [DomainConfigWrite],
         /// If present, switches both the chip side (`UartBaud`
         /// register write) and the host tty to `bosminer`'s real
         /// confirmed 3,125,000 operating baud after the rest of
-        /// bring-up completes -- see HANDOFF.md's Round 7/8 for why
-        /// this is untested-but-plausible rather than confirmed.
-        /// `None` stays at the discovery-time 115200 baud throughout.
+        /// bring-up completes. Round 8 tested this switch on real
+        /// hardware: by itself it changed nothing, though the
+        /// investigation around it found and removed a real corruption
+        /// source. `None` stays at the discovery-time 115200 baud
+        /// throughout.
         baud_control: Option<Box<dyn BaudControl>>,
     },
 }
@@ -573,41 +577,50 @@ where
 ///
 /// The sequence is real, captured wire data (via a ptrace syscall
 /// tracer against `bosminer`'s own successful bring-up -- see
-/// HANDOFF.md's Round 4/5/6), not a guessed-at adaptation of the
-/// BM1370 sequence above -- BM1366's actual required order and
-/// register values differ genuinely, not just in tuning constants
-/// (`initialize_chip`'s doc comment has the full rationale for why
-/// this is a separate function rather than a shared parameterized
-/// one).
+/// `docs/s19k-pro/reference/full-engineering-log.md`'s Round 4/5/6),
+/// not a guessed-at adaptation of the BM1370 sequence above --
+/// BM1366's actual required order and register values differ
+/// genuinely, not just in tuning constants (`initialize_chip`'s doc
+/// comment has the full rationale for why this is a separate function
+/// rather than a shared parameterized one).
 ///
-/// **Real hashing is not yet confirmed working** (see HANDOFF.md's
-/// "Round 7"). This sequence gets chips discovered, addressed, and
-/// accepting well-formed `JobFull` commands over the real wire -- but
-/// zero `Nonce` responses were ever observed on real hardware, even
-/// after ruling out two real hypotheses (missing `NonceRange`; PLL
-/// frequency too low) by testing fixes for each with no change in
-/// outcome. The remaining known gaps below are the next things to
-/// investigate, not a complete list of "safe to ignore" caveats the
-/// way they might read for an otherwise-working sequence:
-/// - Switches to `bosminer`'s real 3,125,000 operating baud only if
-///   the caller supplies a [`BaudControl`] -- untested on real
-///   hardware as of this writing (see HANDOFF.md's Round 8). Uses
-///   the exact captured `UartBaud` wire value (`0x00003011`), not
-///   this module's `BaudRate::Baud3M`/`Baud1M` constants, which were
-///   captured from a different chip/board and don't match. With no
-///   `BaudControl` supplied, stays at the discovery-time 115200 baud
-///   throughout, matching Round 7's behavior.
-/// - Skips the per-chip addressed `InitControl`/`MiscControl`/`Core`/
-///   `PllDivider` writes observed at specific individual chip
-///   addresses (distinct from `domain_config`) -- these look like
-///   genuine per-chip factory calibration data, not something safe
-///   to replicate generically across units, but could plausibly be
-///   load-bearing for actual hashing rather than just tuning.
-/// - `NonceRange` is now the real BM1366 value (`0x5a10_0000`, sourced
-///   from the reference's `chip_config.rs`), not the BM1370-reused
-///   placeholder (`0xB51E0000`) used through Round 14 -- it was never
-///   observed as a broadcast write in this project's own real
-///   capture, so this is the reference's value, not ours.
+/// **This sequence mines.** Real `Nonce` responses decode and the pool
+/// accepts real shares (bring-up log, Round 12), and it is confirmed
+/// thermally and electrically stable at ~300 MHz for roughly 4-6 TH/s
+/// (Round 14).
+///
+/// What is *not* yet established for this driver is frequency headroom.
+/// Every frequency above ~300 MHz failed identically here -- flat
+/// temperature, zero nonces -- and Round 15 found why: a byte-order bug
+/// on the `Core` register left `CORE_MAILBOX`'s "apply to all cores"
+/// bit clear, so core-enable never applied chain-wide. That fix is in
+/// this crate (see `protocol.rs`'s `encode_data` and the broadcast
+/// writes below), but the ~105 TH/s at 575 MHz that proved it was
+/// measured against the *reference* port, not this driver, which has
+/// not been retested above 300 MHz since. Any shortfall now is a
+/// driver bug, not a hardware limit.
+///
+/// Specifics worth knowing before changing any of this:
+/// - Switches to `bosminer`'s real 3,125,000 operating baud when the
+///   caller supplies a [`BaudControl`], which the S19K Pro board driver
+///   does. Round 8 tested the switch on real hardware: it changed
+///   nothing by itself, but the investigation found and removed a real
+///   corruption source. Uses the exact captured `UartBaud` wire value
+///   (`0x00003011`), not this module's `BaudRate::Baud3M`/`Baud1M`
+///   constants, which were captured from a different chip/board and do
+///   not match. With no `BaudControl`, stays at the discovery-time
+///   115200 baud throughout.
+/// - Sends the per-chip addressed `InitControl`/`MiscControl`/`Core`
+///   pass with the real captured values, which genuinely differ from
+///   the broadcast ones (`00 07 01 f0` / `f0 00 c1 00`, and the `Core`
+///   triplet in its captured order). Round 10 sent this pass with
+///   guessed values and stayed silent; Round 12 extracted the real ones
+///   from the existing trace and mined the first accepted share.
+/// - `NonceRange` is the real BM1366 value (`0x5a10_0000`). **Do not
+///   "fix" this by calling `multi_chip()`:** for 77 chips that selects
+///   the S21 Pro value and discards the captured BM1366 one. Real
+///   firmware broadcasts a single value and still reaches full
+///   hashrate.
 async fn initialize_chip_bm1366_chain<W>(
     chip_count: u8,
     domain_config: &[DomainConfigWrite],
@@ -817,7 +830,8 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    // Rounds 12-14 (see HANDOFF.md) tried five real hypotheses for why
+    // Rounds 12-14 (see the engineering log) tried five real
+    // hypotheses for why
     // nothing above ~300MHz produced real hashing (flat temperature,
     // zero nonces despite clean communication) -- fb_div range, ramp
     // granularity, VCO stability mid-ramp, settle time, post-divider

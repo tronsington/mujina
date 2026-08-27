@@ -3,7 +3,8 @@
 //! touching its file descriptors ourselves.
 //!
 //! Three rounds of software-only hypothesis testing on chip discovery
-//! (see HANDOFF.md) hit a wall with no way forward short of capturing
+//! (see `docs/s19k-pro/bring-up-log.md`, Rounds 1-3) hit a wall with
+//! no way forward short of capturing
 //! bosminer's actual byte-level traffic. No hardware logic analyzer
 //! is available, and this kernel wasn't built with kprobe/uprobe
 //! support, so this is the software equivalent: launch bosminer

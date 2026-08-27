@@ -607,7 +607,9 @@ impl Register {
             // real big-endian `put_u32` -- silently sent a malformed
             // CORE_MAILBOX command (see REFERENCE.md's "0x3C -
             // CORE_MAILBOX") instead of the intended one. Found via
-            // HANDOFF.md's Round 9: real hardware testing showed the
+            // The engineering log
+            // (`docs/s19k-pro/reference/full-engineering-log.md`),
+            // Round 9: real hardware testing showed the
             // Core write corrupting chip communication for an
             // extended period; decoding the real captured bytes
             // big-endian instead cleanly matches REFERENCE.md's
