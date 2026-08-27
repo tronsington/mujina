@@ -104,6 +104,64 @@ Note the miner's BusyBox has no `pgrep`/`pkill -f` reliability, no
 `curl`, `wget`, `python`, `bash`, or `nc`. Kill by explicit PID and
 verify via `/proc/<pid>`.
 
+## Unattended operation
+
+`mujina-minerd` has no supervisor of its own. If it exits, nothing
+restarts it — and because an unclean exit skips the Rust `Drop`
+handler, it leaves the **PSU still enabled** with the chips idle. That
+is thermally harmless (fans hold their last PWM duty) but it silently
+stops mining, which matters for overnight soaks and long tuning runs.
+
+[`reference/mujina-supervisor.sh`](reference/mujina-supervisor.sh) is a
+minimal supervisor for this. Set the env block at the top, then:
+
+```sh
+/sbin/start-stop-daemon -S -b -m \
+  -p /tmp/mujina-supervisor.pid -x /tmp/mujina-supervisor.sh
+```
+
+It does three things a naive `while true` loop does not:
+
+1. **Forces the PSU off between attempts.** Relaunching onto a hot rail
+   skips the known-good cold-start path (12 V ramp + chain reset), and
+   it means the window between crash and restart is spent with the rail
+   *off* — the safest state, since mujina's own overtemp gate dies with
+   the process.
+2. **Backs off on a crash loop.** Runs shorter than 120 s count as
+   failures, with a progressively longer delay. Hammering a 2 kW PSU
+   on/off repeatedly is worse than not restarting at all.
+3. **Falls back to `bosminer`** after five consecutive short runs, so
+   the machine keeps mining even if mujina is unstable.
+
+Logs to `/tmp/mujina-supervisor.log` (restart history) and
+`/tmp/mujina.log` (current run, with `.prev` kept for the one before).
+At `RUST_LOG=info` that runs around 3–4 MB per 8 h — fine against the
+70 MB tmpfs, but worth watching if you raise the log level.
+
+Verify it actually works before trusting it: kill mujina and confirm
+the supervisor logs the exit and relaunches.
+
+### Two traps on this hardware
+
+- **`setsid` does not exist on the miner.** `setsid nohup ... &` fails
+  silently — the command simply isn't there, so nothing starts and
+  nothing is logged. Use `start-stop-daemon`, which BraiinsOS already
+  uses for `bosminer` itself.
+- **Beware self-matching process searches.** `pkill -f mujina-minerd`,
+  or a `grep` over `/proc/*/cmdline`, will also match *your own shell*
+  when the search string appears in its command line — killing your SSH
+  session instead of the target. Match `argv[0]` exactly:
+
+  ```sh
+  for p in $(ls /proc | grep -E '^[0-9]+$'); do
+    a=$(tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | head -1)
+    [ "$a" = "/tmp/mujina-minerd-corefix" ] && echo $p
+  done
+  ```
+
+Note the binary and this script both live in the miner's `/tmp`, which
+is a tmpfs wiped on reboot — redeploy both after a miner restart.
+
 ## Measuring hashrate correctly
 
 This is the part most likely to mislead you.

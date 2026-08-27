@@ -360,5 +360,10 @@ true ceiling, not the 75 °C cutoff.
   reaching it from the LAN needs either `MUJINA_API_LISTEN=0.0.0.0:7785`
   plus a firewall rule, or an SSH tunnel (`~/miner-dashboard/tunnel.sh`).
 - **HashScope** stratum MITM proxy for per-submit accept/reject.
+- **Supervisor** — `reference/mujina-supervisor.sh`, which keeps
+  mujina running unattended with a clean PSU cycle between attempts,
+  crash-loop backoff, and a `bosminer` fallback. Needed for the long
+  unattended runs that characterisation and tuning will require. See
+  [running-it.md](running-it.md#unattended-operation).
 - **`~/mujina-s19kpro-ref/s19k-fixes.patch`** — the fixes that made the
   reference port reach ~105 TH/s on this hardware.
