@@ -2,28 +2,52 @@
 
 ## Cross-compilation
 
-The control board runs a 4.9.113 aarch64 vendor kernel executing
-**32-bit ARM EABI** userspace binaries. Target
-`armv7-unknown-linux-musleabihf`, built with `zig cc` as the
-cross-linker:
+The control board runs a 4.9.113 aarch64 vendor kernel that executes
+**32-bit ARM EABI** userspace binaries, so the build target is
+`armv7-unknown-linux-musleabihf`, not an aarch64 one.
+
+`zig cc` stands in for a musl cross-toolchain: a single self-contained
+download, no root, no distro package, and no separately built sysroot.
+Fetch it once, then build:
 
 ```sh
-source "$HOME/.cargo/env"
-PATH="$HOME/bin:$PATH" \
-CC_armv7_unknown_linux_musleabihf=zigcc-armv7-musleabihf \
-AR_armv7_unknown_linux_musleabihf=zigar-armv7-musleabihf \
-CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=zigcc-armv7-musleabihf \
-RUSTFLAGS="-C link-self-contained=no" \
-cargo build --release --target armv7-unknown-linux-musleabihf --bin mujina-minerd
+just fetch-zig      # pinned zig 0.16.0, checksum-verified
+just build-s19k     # -> target/armv7-unknown-linux-musleabihf/release/mujina-minerd
 ```
 
-Deploy with `scp -O` (the miner's SSH server is old enough that the
-newer SFTP-based transfer fails).
+`build-s19k` adds the rustup target if it is missing, and
+`just deploy-s19k root@<miner>` copies the result to the miner's `/tmp`
+with `scp -O` --- the miner's SSH server is old enough that the newer
+SFTP-based transfer fails.
 
-> `cargo test` does **not** work on an x86_64 host here — the `udev`
-> dependency needs `libudev` headers, and only the musl cross-target
-> excludes it. Validate register byte order by arithmetic or on the
-> target, not via host tests.
+Plain cargo works too. The compiler, linker and archiver wiring lives
+in `.cargo/config.toml`, so nothing needs to be set in the
+environment:
+
+```sh
+cargo build --release --target armv7-unknown-linux-musleabihf \
+    --bin mujina-minerd
+```
+
+To build the diagnostic tools as well, add `--features dev-tools`; see
+[hardware.md](hardware.md) for what each one is for.
+
+Two consequences of this target worth knowing, both already handled in
+the manifests:
+
+- **No OpenSSL.** `openssl-sys` does not cross-compile here, so
+  `reqwest` is configured for `rustls` instead of its default
+  `native-tls`. That is why `deny.toml` allows the ISC and
+  CDLA-Permissive-2.0 licenses the rustls chain carries.
+- **No `udev`.** `tracing-journald` and `udev` are gated to
+  `target_env = "gnu"`, so the musl target excludes them --- which is
+  also why host tests behave differently (see below).
+
+> `cargo test` does **not** work on an x86_64 host without `libudev`
+> headers installed; only the musl cross-target excludes `udev`. Use
+> `just in-container test`, which runs in the build container where
+> those headers are present, or validate register byte order by
+> arithmetic or on the target.
 
 ### Watch the miner's `/tmp`
 
