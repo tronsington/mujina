@@ -4,8 +4,11 @@ Working notes for adding BraiinsOS-style **power targeting** to the
 S19K Pro: you enter a wattage, firmware picks frequency and voltage to
 hit it while maximising hashrate.
 
-**Status: design only.** Nothing here is implemented. This document
-exists so the reasoning survives into the implementation session.
+**Status: partially implemented.** Forward model lives in
+`mujina-miner/src/power_estimate.rs` and is published on
+`GET /api/v0/miner` as `boards[].powers[]` with
+`source: "estimated"`, plus `frequency_mhz` / `chip_count`. Runtime
+frequency control and the power-limit loop are still design-only.
 
 ## Measured baseline to design against
 

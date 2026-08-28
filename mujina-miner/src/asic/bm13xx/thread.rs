@@ -222,6 +222,14 @@ pub enum ChipInitStrategy {
         /// source. `None` stays at the discovery-time 115200 baud
         /// throughout.
         baud_control: Option<Box<dyn BaudControl>>,
+        /// Chip clock the frequency ramp climbs to, in MHz. Was a
+        /// compile-time 575.0 const in this module until callers could
+        /// only change it by editing and recompiling -- the caller
+        /// (`board/antminer_s19k_am3.rs`) is responsible for validating
+        /// this against a known-safe envelope before constructing the
+        /// strategy; this module only rejects values `calculate_pll_bm1366`
+        /// can't find a valid PLL divider chain for.
+        target_frequency_mhz: f32,
     },
 }
 
@@ -316,6 +324,40 @@ where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    // A stuck init otherwise hangs forever with no signal beyond
+    // `hashrate=--` on every scheduler tick -- see the mujina channel
+    // thread, 2026-08-28 (three live hangs on the S19K Pro, each
+    // needing a human to notice and kill it). 45s is generous
+    // headroom over the slowest real sequence, the Bm1366Chain ramp
+    // at the top of its allowed range (`PowerConfig::MAX_FREQUENCY_MHZ`
+    // in `board/antminer_s19k_am3.rs`): ~95 steps * 100ms =~ 9.5s for
+    // the ramp alone, plus well under a second for the rest of the
+    // per-chip pass -- comfortably inside 45s even with real serial
+    // latency on top.
+    const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+    tokio::time::timeout(
+        INIT_TIMEOUT,
+        initialize_chip_inner(strategy, chip_commands, peripherals, asic_difficulty),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(anyhow!(
+            "chip initialization timed out after {INIT_TIMEOUT:?}"
+        ))
+    })
+}
+
+async fn initialize_chip_inner<W>(
+    strategy: &ChipInitStrategy,
+    chip_commands: &mut W,
+    peripherals: &mut BoardPeripherals,
+    asic_difficulty: Log2Difficulty,
+) -> Result<()>
+where
+    W: Sink<protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
     match strategy {
         ChipInitStrategy::Bm1370Single => {
             initialize_chip_bm1370_single(chip_commands, peripherals, asic_difficulty).await
@@ -324,11 +366,13 @@ where
             chip_count,
             domain_config,
             baud_control,
+            target_frequency_mhz,
         } => {
             initialize_chip_bm1366_chain(
                 *chip_count,
                 domain_config,
                 baud_control.as_deref(),
+                *target_frequency_mhz,
                 chip_commands,
                 peripherals,
                 asic_difficulty,
@@ -636,6 +680,7 @@ async fn initialize_chip_bm1366_chain<W>(
     chip_count: u8,
     domain_config: &[DomainConfigWrite],
     baud_control: Option<&dyn BaudControl>,
+    target_frequency_mhz: f32,
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
@@ -926,27 +971,29 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // Frequency ramp -- deliberately last. Targets 575MHz: the
-    // reference's own real hardware measurement on this exact chip
+    // Frequency ramp -- deliberately last. Default target is 575MHz:
+    // the reference's own real hardware measurement on this exact chip
     // family (39.68 TH/s on mujina itself, LuxOS gets 39.15-39.33
     // TH/s at the same point) -- deliberately not the 645MHz factory
     // ceiling, which their notes call "right at the edge of
     // stability" (645MHz measured *less* hashrate than 575MHz).
-    const TARGET_MHZ: f32 = 575.0;
+    // `target_frequency_mhz` is caller-supplied (see
+    // `ChipInitStrategy::Bm1366Chain`) rather than hardcoded here so a
+    // lower-power operating point doesn't need a recompile.
     const RAMP_STEP_MHZ: f32 = 6.25;
     const RAMP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
     debug!(
-        target_mhz = TARGET_MHZ,
+        target_mhz = target_frequency_mhz,
         step_mhz = RAMP_STEP_MHZ,
         "Ramping frequency"
     );
     let mut mhz = 56.25f32;
     loop {
-        mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
+        mhz = if mhz + RAMP_STEP_MHZ < target_frequency_mhz {
             mhz + RAMP_STEP_MHZ
         } else {
-            TARGET_MHZ
+            target_frequency_mhz
         };
         let pll = calculate_pll_bm1366(mhz)
             .with_context(|| format!("no valid BM1366 PLL config for {mhz}MHz"))?;
@@ -954,7 +1001,7 @@ where
             .await
             .with_context(|| format!("failed to send PllDivider for {mhz}MHz ramp step"))?;
         tokio::time::sleep(RAMP_STEP_DELAY).await;
-        if mhz >= TARGET_MHZ {
+        if mhz >= target_frequency_mhz {
             break;
         }
     }

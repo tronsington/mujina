@@ -46,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::{
-    api_client::types::{BoardTelemetry, PowerMeasurement, TemperatureSensor},
+    api_client::types::{BoardTelemetry, PowerMeasurement, PowerSource, TemperatureSensor},
     asic::{
         ChipInfo,
         bm13xx::{
@@ -59,8 +59,10 @@ use crate::{
     hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue},
     linux_hw::{BitBangI2c, LinuxI2c, SysfsGpio, SysfsGpioPin},
     peripheral::{apw12::Apw12, tmp1075::Tmp1075},
+    power_estimate::PowerEstimateInput,
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialStream},
+    types::Temperature,
 };
 
 inventory::submit! {
@@ -108,20 +110,21 @@ const PSU_NEN_OFFSET: u8 = 26;
 const PSU_SCL_GPIO: u32 = 476;
 const PSU_SDA_GPIO: u32 = 477;
 
-/// Real target output voltage. `bosminer`'s own PSU ramp log (Round
-/// 3) confirmed 15.2V as its initial *bring-up* ceiling, but Round
-/// 14's investigation found that's not the real sustained-operation
-/// target: a community fork (github.com/Schnitzel/mujina,
-/// amlogic-s19kpro-support branch) documents Braiins' own bosminer
-/// reporting this exact hashboard model's (BHB56902) factory ATE
-/// setpoint directly (`Detected hashboard #2: Voltage (Avg.) 13.90 V,
-/// Frequency (Avg.) 645 MHz`), and their own real hardware testing
-/// confirms real sustained hashing at that voltage. Every Round 14
-/// test that failed above 300MHz ran the entire time at the 15.2V
-/// bring-up ceiling, never adjusted down -- this may have been
-/// silently starving or destabilizing the PLL, independent of the
-/// PLL divider math itself.
-const PSU_TARGET_VOLTS: f32 = 13.9;
+/// Default real target output voltage. `bosminer`'s own PSU ramp log
+/// (Round 3) confirmed 15.2V as its initial *bring-up* ceiling, but
+/// Round 14's investigation found that's not the real
+/// sustained-operation target: a community fork
+/// (github.com/Schnitzel/mujina, amlogic-s19kpro-support branch)
+/// documents Braiins' own bosminer reporting this exact hashboard
+/// model's (BHB56902) factory ATE setpoint directly (`Detected
+/// hashboard #2: Voltage (Avg.) 13.90 V, Frequency (Avg.) 645 MHz`),
+/// and their own real hardware testing confirms real sustained hashing
+/// at that voltage. Every Round 14 test that failed above 300MHz ran
+/// the entire time at the 15.2V bring-up ceiling, never adjusted down
+/// -- this may have been silently starving or destabilizing the PLL,
+/// independent of the PLL divider math itself. Overridable via
+/// `MUJINA_ANTMINER_S19K_VOLTAGE` -- see [`PowerConfig`].
+const DEFAULT_VOLTAGE_V: f32 = 13.9;
 const PSU_RAMP_STEP_VOLTS: f32 = 0.5;
 const PSU_RAMP_STEP_DELAY: Duration = Duration::from_millis(1500);
 
@@ -133,6 +136,100 @@ const SENSOR_I2C_DEVICE: &str = "/dev/i2c-1";
 
 /// Expected chips per chain (S19K Pro AM3 hashboards).
 pub(crate) const EXPECTED_CHIPS: usize = 77;
+
+/// Default chip clock the hash-thread ramp targets, overridable via
+/// `MUJINA_ANTMINER_S19K_FREQUENCY_MHZ` -- see [`PowerConfig`].
+const DEFAULT_FREQUENCY_MHZ: f32 = 575.0;
+
+/// Runtime-configurable frequency/voltage operating point, read once at
+/// board bring-up.
+///
+/// Both were compile-time consts until this landed -- editing the
+/// reference TOML's `initial_voltage` or relabeling a binary did
+/// nothing, because nothing in the daemon actually read them (see the
+/// mujina channel thread on 2026-08-28: a "450MHz" one-off build never
+/// changed frequency, and a `12.0V`-at-575MHz combo dropped chip
+/// verify because nothing validated the pair against a known-safe
+/// envelope). Range is bosminer's own continuous-tuning grid for this
+/// exact 3x77-chip unit (`docs/s19k-pro/power-controls.md`: 1560-2760W
+/// spanning 12.00-13.11V CT setpoints, 251-693MHz chip range) plus this
+/// driver's own confirmed 575MHz/13.9V operating point, rounded out
+/// with headroom -- not an arbitrary clamp. 645MHz is documented as
+/// "right at the edge of stability" (see `thread.rs`'s frequency-ramp
+/// comment), so the max sits just above it rather than at some
+/// untested ceiling. Out-of-range requests are clamped and logged
+/// rather than silently accepted or rejected outright, matching this
+/// codebase's existing `CpuMinerConfig` pattern.
+///
+/// Voltage ceiling raised 14.0 -> 15.2V on 2026-08-28 (mujina channel
+/// thread) to retest the one operating point this driver has ever
+/// actually hashed at: 300MHz/15.2V, confirmed real in Round 12-14
+/// (`docs/s19k-pro/reference/full-engineering-log.md`) before later
+/// rounds moved to bosminer's 13.9V factory setpoint. 15.2V is
+/// bosminer's own confirmed bring-up ceiling for this exact hashboard,
+/// not an untested value -- but it is above the reference port's own
+/// 13.9-14.5V range (`docs/s19k-pro/power-controls.md`), so treat it as
+/// a temporary widening for this test, not a new steady-state default.
+#[derive(Debug, Clone, Copy)]
+struct PowerConfig {
+    frequency_mhz: f32,
+    voltage_v: f32,
+}
+
+impl PowerConfig {
+    const MIN_FREQUENCY_MHZ: f32 = 200.0;
+    const MAX_FREQUENCY_MHZ: f32 = 650.0;
+    const MIN_VOLTAGE_V: f32 = 12.0;
+    const MAX_VOLTAGE_V: f32 = 15.2;
+
+    fn from_env() -> Self {
+        Self {
+            frequency_mhz: env_f32_clamped(
+                "MUJINA_ANTMINER_S19K_FREQUENCY_MHZ",
+                DEFAULT_FREQUENCY_MHZ,
+                Self::MIN_FREQUENCY_MHZ,
+                Self::MAX_FREQUENCY_MHZ,
+            ),
+            voltage_v: env_f32_clamped(
+                "MUJINA_ANTMINER_S19K_VOLTAGE",
+                DEFAULT_VOLTAGE_V,
+                Self::MIN_VOLTAGE_V,
+                Self::MAX_VOLTAGE_V,
+            ),
+        }
+    }
+}
+
+/// Parse an f32 from environment variable `var`, falling back to
+/// `default` when unset or unparseable, and clamping the result to
+/// `[min, max]`. Logs a warning whenever the requested value isn't the
+/// one actually used, so a bad or out-of-envelope setting is visible in
+/// the daemon's own logs rather than silently taking effect (or not).
+fn env_f32_clamped(var: &str, default: f32, min: f32, max: f32) -> f32 {
+    let value = match std::env::var(var) {
+        Ok(raw) => match raw.parse::<f32>() {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(var, raw, error = %e, default, "invalid value, using default");
+                return default;
+            }
+        },
+        Err(_) => return default,
+    };
+
+    let clamped = value.clamp(min, max);
+    if clamped != value {
+        warn!(
+            var,
+            requested = value,
+            clamped,
+            min,
+            max,
+            "requested value outside safe range, clamped"
+        );
+    }
+    clamped
+}
 
 /// Per-chip addressed `IoDriverStrength`(`0x58`)/`UartRelay`(`0x2C`)
 /// writes, captured verbatim from a real successful bring-up (chain
@@ -263,6 +360,13 @@ impl BaudControl for SerialControl {
 }
 
 async fn create_board() -> Result<BackplaneConnector> {
+    let power_config = PowerConfig::from_env();
+    info!(
+        frequency_mhz = power_config.frequency_mhz,
+        voltage_v = power_config.voltage_v,
+        "Power config"
+    );
+
     let mut chain_gpio = SysfsGpio::new(GPIO_BASE);
 
     let mut pins = Vec::with_capacity(CHAIN_ENABLE_OFFSETS.len());
@@ -315,9 +419,20 @@ async fn create_board() -> Result<BackplaneConnector> {
     // failure here is deliberately non-fatal, since temperature/PSU
     // telemetry and the hash threads created below are independently
     // useful even if this early check has a bad run.
-    match power_up_and_validate(&mut psu, &mut psu_nen_pin, &chain_state).await {
-        Ok(chip_counts) => {
-            for (chain, count) in chip_counts.iter().enumerate() {
+    //
+    // Chip counts also feed the APW12 power estimate in spawn_monitor.
+    // If discovery fails we fall back to the expected full population
+    // so the API still has a labeled estimate when voltage is readable.
+    let chip_counts = match power_up_and_validate(
+        &mut psu,
+        &mut psu_nen_pin,
+        &chain_state,
+        power_config.voltage_v,
+    )
+    .await
+    {
+        Ok(counts) => {
+            for (chain, count) in counts.iter().enumerate() {
                 if *count == EXPECTED_CHIPS {
                     info!(chain = chain + 1, chips = count, "Chain discovery OK");
                 } else {
@@ -329,11 +444,19 @@ async fn create_board() -> Result<BackplaneConnector> {
                     );
                 }
             }
+            counts
         }
         Err(e) => {
             warn!(error = ?e, "Chain power-up/discovery failed");
+            [EXPECTED_CHIPS; 3]
         }
-    }
+    };
+    let discovered_chips: u32 = chip_counts.iter().map(|&c| c as u32).sum();
+
+    // Shared with the monitor task below so a thermal emergency can
+    // cut power itself instead of only ever reporting a number nobody
+    // reads back -- see EMERGENCY_TEMP_C in spawn_monitor.
+    let psu_nen_pin: Arc<Mutex<SysfsGpioPin>> = Arc::new(Mutex::new(psu_nen_pin));
 
     let info = BoardInfo {
         model: "Antminer S19K Pro (AM3)".to_string(),
@@ -348,18 +471,31 @@ async fn create_board() -> Result<BackplaneConnector> {
         name: info.serial_number.clone().unwrap(),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
+        frequency_mhz: Some(power_config.frequency_mhz),
+        chip_count: Some(discovered_chips),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
-
-    let cancel = CancellationToken::new();
-    let monitor_task = spawn_monitor(temp_sensors, psu, telemetry_tx, cancel.clone());
 
     // One BM13xxThread per chain, each with its own real serial
     // connection but sharing the same idempotent chain-enable/reset
     // state -- see SharedChainEnable. A chain whose UART fails to
     // open is skipped (logged), not fatal to the other chains.
     let (thread_shutdown_tx, _initial_removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+
+    let cancel = CancellationToken::new();
+    let monitor_task = spawn_monitor(
+        temp_sensors,
+        psu,
+        telemetry_tx,
+        cancel.clone(),
+        discovered_chips,
+        power_config.frequency_mhz,
+        chain_state.clone(),
+        psu_nen_pin.clone(),
+        thread_shutdown_tx.clone(),
+    );
+
     let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
     for (chain, &tty) in CHAIN_TTYS.iter().enumerate() {
         let stream = match SerialStream::new(tty, CHAIN_BAUD) {
@@ -394,6 +530,7 @@ async fn create_board() -> Result<BackplaneConnector> {
                 chip_count: EXPECTED_CHIPS as u8,
                 domain_config: DOMAIN_CONFIG_WRITES,
                 baud_control: Some(Box::new(control)),
+                target_frequency_mhz: power_config.frequency_mhz,
             },
         );
         threads.push(Box::new(thread));
@@ -431,6 +568,7 @@ async fn power_up_and_validate(
     psu: &mut Apw12<BitBangI2c>,
     psu_nen_pin: &mut SysfsGpioPin,
     chain_state: &SharedChainStateHandle,
+    target_volts: f32,
 ) -> Result<[usize; 3]> {
     psu.disable_watchdog()
         .await
@@ -442,7 +580,7 @@ async fn power_up_and_validate(
         .await
         .context("enabling PSU output (PSU_nEN low)")?;
 
-    ramp_psu_voltage(psu, PSU_TARGET_VOLTS).await?;
+    ramp_psu_voltage(psu, target_volts).await?;
 
     // Same idempotent reset any hash thread's own lazy init would
     // trigger (see SharedChainEnable) -- whichever runs first, this
@@ -646,12 +784,29 @@ pub(crate) async fn discover_chain(tty: &str) -> Result<Vec<ChipInfo>> {
     Ok(chips)
 }
 
+/// Hottest reading across all sensors, or `None` if every read failed
+/// this tick (treated the same as "not overheating" -- a bank of
+/// dead sensors isn't itself a thermal event).
+fn hottest_c(temperatures: &[TemperatureSensor]) -> Option<f32> {
+    temperatures
+        .iter()
+        .filter_map(|t| t.temperature)
+        .map(Temperature::as_degrees_c)
+        .fold(None, |max, c| Some(max.map_or(c, |m: f32| m.max(c))))
+}
+
 /// Spawn a task that periodically reads sensors and PSU telemetry.
+#[expect(clippy::too_many_arguments)]
 fn spawn_monitor(
     mut temp_sensors: Vec<Tmp1075<LinuxI2c>>,
     mut psu: Apw12<BitBangI2c>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
     cancel: CancellationToken,
+    chip_count: u32,
+    frequency_mhz: f32,
+    chain_state: SharedChainStateHandle,
+    psu_nen_pin: Arc<Mutex<SysfsGpioPin>>,
+    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INTERVAL: Duration = Duration::from_secs(5);
@@ -667,6 +822,20 @@ fn spawn_monitor(
             "chain3-inlet",
             "chain3-outlet",
         ];
+
+        // This driver has no per-chip thermal cutoff (no firmware
+        // running on the chips themselves to enforce one), so the
+        // host-side monitor is the only thing standing between a
+        // stuck/hung chip init (chains powered and drawing full
+        // current with no clock ramp to show for it -- see the
+        // mujina channel thread, 2026-08-28) and an unattended
+        // overtemp. 75C matches the dashboard tool's own configured
+        // cutoff so both agree on the same number. 3 consecutive
+        // bad ticks (matching bitaxe.rs's pattern) before tripping,
+        // so one noisy I2C read doesn't kill a healthy board.
+        const EMERGENCY_TEMP_C: f32 = 75.0;
+        const BAD_READING_LIMIT: u32 = 3;
+        let mut consecutive_hot = 0u32;
 
         loop {
             tokio::select! {
@@ -689,13 +858,52 @@ fn spawn_monitor(
                 });
             }
 
+            match hottest_c(&temperatures) {
+                Some(hottest) if hottest >= EMERGENCY_TEMP_C => {
+                    consecutive_hot += 1;
+                    warn!(
+                        hottest_c = hottest,
+                        consecutive = consecutive_hot,
+                        "Temperature above emergency threshold"
+                    );
+                }
+                _ => consecutive_hot = 0,
+            }
+
+            if consecutive_hot >= BAD_READING_LIMIT {
+                error!(
+                    consecutive = consecutive_hot,
+                    "THERMAL EMERGENCY: cutting chain power"
+                );
+                if let Err(e) = thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
+                    warn!(error = %e, "Failed to signal hash threads during thermal emergency");
+                }
+                chain_state.lock().await.disable_all().await;
+                if let Err(e) = psu_nen_pin.lock().await.write(PinValue::High).await {
+                    error!(error = %e, "Failed to disable PSU output during thermal emergency");
+                }
+                break;
+            }
+
+            // APW12 has no current sense — watts are always an estimate
+            // (same class as Braiins/LuxOS on this PSU). Label them.
             let power = match psu.measure_voltage().await {
-                Ok(voltage) => Some(PowerMeasurement {
-                    name: "psu".to_string(),
-                    voltage_v: Some(voltage),
-                    current_a: None,
-                    power_w: None,
-                }),
+                Ok(voltage) => {
+                    let estimated_w = PowerEstimateInput {
+                        frequency_mhz,
+                        rail_volts: voltage,
+                        chip_count,
+                    }
+                    .estimate()
+                    .map(|e| e.ac_watts);
+                    Some(PowerMeasurement {
+                        name: "psu".to_string(),
+                        voltage_v: Some(voltage),
+                        current_a: None,
+                        power_w: estimated_w,
+                        source: estimated_w.map(|_| PowerSource::Estimated),
+                    })
+                }
                 Err(e) => {
                     warn!(error = %e, "PSU voltage read failed");
                     None
@@ -703,6 +911,8 @@ fn spawn_monitor(
             };
 
             telemetry_tx.send_modify(|t| {
+                t.frequency_mhz = Some(frequency_mhz);
+                t.chip_count = Some(chip_count);
                 t.temperatures = temperatures;
                 t.powers = power.into_iter().collect();
             });
@@ -713,7 +923,7 @@ fn spawn_monitor(
 /// Antminer S19K Pro board state, held for the board's lifetime.
 struct AntminerS19kAm3 {
     chain_state: SharedChainStateHandle,
-    psu_nen_pin: SysfsGpioPin,
+    psu_nen_pin: Arc<Mutex<SysfsGpioPin>>,
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
     monitor_cancel: CancellationToken,
     monitor_task: tokio::task::JoinHandle<()>,
@@ -733,6 +943,116 @@ impl AntminerS19kAm3 {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
         self.chain_state.lock().await.disable_all().await;
-        let _ = self.psu_nen_pin.write(PinValue::High).await; // disable PSU output
+        let _ = self.psu_nen_pin.lock().await.write(PinValue::High).await; // disable PSU output
+    }
+}
+
+#[cfg(test)]
+mod power_config_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn from_env_defaults_when_unset() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+            std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, DEFAULT_FREQUENCY_MHZ);
+        assert_eq!(config.voltage_v, DEFAULT_VOLTAGE_V);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_clamps_out_of_range_requests() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ", "900");
+            std::env::set_var("MUJINA_ANTMINER_S19K_VOLTAGE", "0.5");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, PowerConfig::MAX_FREQUENCY_MHZ);
+        assert_eq!(config.voltage_v, PowerConfig::MIN_VOLTAGE_V);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+            std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_falls_back_to_default_on_garbage_input() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ", "not-a-number");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, DEFAULT_FREQUENCY_MHZ);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_accepts_values_within_range() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ", "450");
+            std::env::set_var("MUJINA_ANTMINER_S19K_VOLTAGE", "12.3");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, 450.0);
+        assert_eq!(config.voltage_v, 12.3);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+            std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hottest_c_tests {
+    use super::*;
+
+    fn sensor(name: &str, temp_c: Option<f32>) -> TemperatureSensor {
+        TemperatureSensor {
+            name: name.to_string(),
+            temperature: temp_c.map(Temperature::from_celsius),
+        }
+    }
+
+    #[test]
+    fn no_sensors_is_none() {
+        assert_eq!(hottest_c(&[]), None);
+    }
+
+    #[test]
+    fn all_failed_reads_is_none() {
+        let readings = [sensor("a", None), sensor("b", None)];
+        assert_eq!(hottest_c(&readings), None);
+    }
+
+    #[test]
+    fn picks_hottest_ignoring_failed_reads() {
+        let readings = [
+            sensor("a", Some(40.0)),
+            sensor("b", None),
+            sensor("c", Some(61.6)),
+        ];
+        assert_eq!(hottest_c(&readings), Some(61.6));
     }
 }

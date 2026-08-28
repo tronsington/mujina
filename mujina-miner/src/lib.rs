@@ -12,6 +12,7 @@ pub mod job_source;
 pub mod linux_hw;
 pub mod mgmt_protocol;
 pub mod peripheral;
+pub mod power_estimate;
 pub mod scheduler;
 pub mod stratum_v1;
 #[cfg(test)]

@@ -280,7 +280,10 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--cy);outline-off
         <div class="mb"><i id="e-bar" style="width:0%;background:var(--cy)"></i></div></div>
       <div class="kv"><b>DRAIN (EST)</b><i id="e-drain">—</i></div>
       <div class="kv"><b>EFFICIENCY</b><i id="e-jth">—</i></div>
-      <div class="hp-note">No current sensor on the APW12 &mdash; drain is estimated.</div>
+      <div class="kv"><b>FREQUENCY</b><i id="e-freq">—</i></div>
+      <div class="kv"><b>CHIPS</b><i id="e-chips">—</i></div>
+      <div class="kv"><b>POWER SOURCE</b><i id="e-psrc">—</i></div>
+      <div class="hp-note">No current sensor on the APW12 &mdash; drain is estimated (prefer firmware model, else P∝N·f·V²).</div>
     </div>
 
     <div class="pnl">
@@ -299,9 +302,11 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--cy);outline-off
     The thermal bar is headroom: (75&nbsp;&minus;&nbsp;hottest&nbsp;sensor)&nbsp;/&nbsp;(75&nbsp;&minus;&nbsp;25),
     so an empty bar is the real overtemp trip point. Hashrate is derived from
     share rate over a trailing 180&nbsp;s window, not from firmware-reported
-    hashrate (which is a fixed nominal constant). Drain is estimated at
-    nameplate efficiency scaled by (V/13.9)&sup2; &mdash; the APW12 exposes no
-    current reading. Standard view: <a href="/">/</a> &middot;
+    hashrate (which is a fixed nominal constant). Drain prefers the
+    firmware <code>powers[].power_w</code> when present (labeled
+    measured/estimated); otherwise a P∝N·f·V² forward model; circular
+    hashrate×J/TH is last resort. The APW12 exposes no current reading.
+    Standard view: <a href="/">/</a> &middot;
     mujina's own: <a href="/builtin">/builtin</a>
   </div>
 </div>
@@ -490,9 +495,14 @@ async function tick(){
     $("e-pct").textContent=fx(v,2)+" V";
   }
   const w=m.est_watts;
+  const psrc=(m.power_source||"").toLowerCase();
+  const estLabel = psrc==="measured" ? "W" : "W (EST)";
   $("e-watts").textContent = w!=null?fx(w/1000,2)+" KW":"";
-  $("e-drain").textContent = w!=null?fx(w,0)+" W (EST)":"—";
+  $("e-drain").textContent = w!=null?fx(w,0)+" "+estLabel:"—";
   $("e-jth").textContent = (w!=null&&hr)?fx(w/hr,1)+" J/TH":"—";
+  $("e-freq").textContent = m.frequency_mhz!=null?fx(m.frequency_mhz,1)+" MHz":"—";
+  $("e-chips").textContent = m.chip_count!=null?String(m.chip_count):"—";
+  $("e-psrc").textContent = m.power_source?String(m.power_source).toUpperCase():"—";
 
   // ── link
   const src=(m.sources||[])[0]||{};

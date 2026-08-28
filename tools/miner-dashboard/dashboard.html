@@ -162,10 +162,10 @@
   Sources: mujina <code>/api/v0/miner</code> on the miner (3 s) &middot;
   pool Prometheus API (30 s) &middot; HashScope stratum proxy (15 s).
   <br>
-  Power is <strong>estimated</strong> at nameplate efficiency
-  (120 TH/s @ 2760 W = 23.0 J/TH) scaled by (V/13.9)²; the APW12
-  protocol exposes only voltage and on/off state, so true wattage is not
-  measurable in software. Use a wall meter or PDU for a real figure.
+  Power prefers firmware <code>powers[].power_w</code> when present
+  (source measured/estimated), else a P∝N·f·V² forward model; circular
+  hashrate×J/TH is last resort. The APW12 exposes no current reading —
+  use a wall meter or PDU for a real figure.
   <br>
   mujina's own top-level <code>hashrate</code> field reads 0 until its
   estimator settles, so this page derives hashrate from share rate instead.
@@ -284,14 +284,11 @@ async function tick(){
     tmax>=70 ? "HIGH — overtemp cutoff is near 75 °C" :
     tmax>=60 ? "warm but fine" : "comfortable";
 
-  let w = null;
-  if(hrS && m && m.volts){
-    const jth = 23.0 * Math.pow(m.volts/13.9, 2);
-    w = hrS * jth;
-  }
+  let w = (m && m.est_watts!=null) ? m.est_watts : null;
+  const psrc = (m && m.power_source) ? String(m.power_source) : null;
   $("watts").innerHTML = (w==null?"—":fmt(w,0)) + '<span class="unit">W</span>';
-  $("watts-sub").textContent = (w!=null && hrS)
-    ? `≈ ${fmt(w/hrS,1)} J/TH assumed · nameplate 23.0 J/TH`
+  $("watts-sub").textContent = (w!=null)
+    ? `${psrc||"estimated"}${hrS?` · ≈ ${fmt(w/hrS,1)} J/TH`:""}${m.frequency_mhz!=null?` · ${fmt(m.frequency_mhz,0)} MHz`:""}${m.chip_count!=null?` · ${m.chip_count} chips`:""}`
     : "estimated — APW12 has no current sensor";
 
   // charts
