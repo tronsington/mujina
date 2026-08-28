@@ -324,6 +324,40 @@ where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    // A stuck init otherwise hangs forever with no signal beyond
+    // `hashrate=--` on every scheduler tick -- see the mujina channel
+    // thread, 2026-08-28 (three live hangs on the S19K Pro, each
+    // needing a human to notice and kill it). 45s is generous
+    // headroom over the slowest real sequence, the Bm1366Chain ramp
+    // at the top of its allowed range (`PowerConfig::MAX_FREQUENCY_MHZ`
+    // in `board/antminer_s19k_am3.rs`): ~95 steps * 100ms =~ 9.5s for
+    // the ramp alone, plus well under a second for the rest of the
+    // per-chip pass -- comfortably inside 45s even with real serial
+    // latency on top.
+    const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+    tokio::time::timeout(
+        INIT_TIMEOUT,
+        initialize_chip_inner(strategy, chip_commands, peripherals, asic_difficulty),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(anyhow!(
+            "chip initialization timed out after {INIT_TIMEOUT:?}"
+        ))
+    })
+}
+
+async fn initialize_chip_inner<W>(
+    strategy: &ChipInitStrategy,
+    chip_commands: &mut W,
+    peripherals: &mut BoardPeripherals,
+    asic_difficulty: Log2Difficulty,
+) -> Result<()>
+where
+    W: Sink<protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
     match strategy {
         ChipInitStrategy::Bm1370Single => {
             initialize_chip_bm1370_single(chip_commands, peripherals, asic_difficulty).await

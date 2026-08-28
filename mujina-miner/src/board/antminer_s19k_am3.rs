@@ -62,6 +62,7 @@ use crate::{
     power_estimate::PowerEstimateInput,
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialStream},
+    types::Temperature,
 };
 
 inventory::submit! {
@@ -442,6 +443,11 @@ async fn create_board() -> Result<BackplaneConnector> {
     };
     let discovered_chips: u32 = chip_counts.iter().map(|&c| c as u32).sum();
 
+    // Shared with the monitor task below so a thermal emergency can
+    // cut power itself instead of only ever reporting a number nobody
+    // reads back -- see EMERGENCY_TEMP_C in spawn_monitor.
+    let psu_nen_pin: Arc<Mutex<SysfsGpioPin>> = Arc::new(Mutex::new(psu_nen_pin));
+
     let info = BoardInfo {
         model: "Antminer S19K Pro (AM3)".to_string(),
         firmware_version: None,
@@ -461,6 +467,12 @@ async fn create_board() -> Result<BackplaneConnector> {
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
 
+    // One BM13xxThread per chain, each with its own real serial
+    // connection but sharing the same idempotent chain-enable/reset
+    // state -- see SharedChainEnable. A chain whose UART fails to
+    // open is skipped (logged), not fatal to the other chains.
+    let (thread_shutdown_tx, _initial_removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+
     let cancel = CancellationToken::new();
     let monitor_task = spawn_monitor(
         temp_sensors,
@@ -469,13 +481,11 @@ async fn create_board() -> Result<BackplaneConnector> {
         cancel.clone(),
         discovered_chips,
         power_config.frequency_mhz,
+        chain_state.clone(),
+        psu_nen_pin.clone(),
+        thread_shutdown_tx.clone(),
     );
 
-    // One BM13xxThread per chain, each with its own real serial
-    // connection but sharing the same idempotent chain-enable/reset
-    // state -- see SharedChainEnable. A chain whose UART fails to
-    // open is skipped (logged), not fatal to the other chains.
-    let (thread_shutdown_tx, _initial_removal_rx) = watch::channel(ThreadRemovalSignal::Running);
     let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
     for (chain, &tty) in CHAIN_TTYS.iter().enumerate() {
         let stream = match SerialStream::new(tty, CHAIN_BAUD) {
@@ -764,7 +774,19 @@ pub(crate) async fn discover_chain(tty: &str) -> Result<Vec<ChipInfo>> {
     Ok(chips)
 }
 
+/// Hottest reading across all sensors, or `None` if every read failed
+/// this tick (treated the same as "not overheating" -- a bank of
+/// dead sensors isn't itself a thermal event).
+fn hottest_c(temperatures: &[TemperatureSensor]) -> Option<f32> {
+    temperatures
+        .iter()
+        .filter_map(|t| t.temperature)
+        .map(Temperature::as_degrees_c)
+        .fold(None, |max, c| Some(max.map_or(c, |m: f32| m.max(c))))
+}
+
 /// Spawn a task that periodically reads sensors and PSU telemetry.
+#[expect(clippy::too_many_arguments)]
 fn spawn_monitor(
     mut temp_sensors: Vec<Tmp1075<LinuxI2c>>,
     mut psu: Apw12<BitBangI2c>,
@@ -772,6 +794,9 @@ fn spawn_monitor(
     cancel: CancellationToken,
     chip_count: u32,
     frequency_mhz: f32,
+    chain_state: SharedChainStateHandle,
+    psu_nen_pin: Arc<Mutex<SysfsGpioPin>>,
+    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INTERVAL: Duration = Duration::from_secs(5);
@@ -787,6 +812,20 @@ fn spawn_monitor(
             "chain3-inlet",
             "chain3-outlet",
         ];
+
+        // This driver has no per-chip thermal cutoff (no firmware
+        // running on the chips themselves to enforce one), so the
+        // host-side monitor is the only thing standing between a
+        // stuck/hung chip init (chains powered and drawing full
+        // current with no clock ramp to show for it -- see the
+        // mujina channel thread, 2026-08-28) and an unattended
+        // overtemp. 75C matches the dashboard tool's own configured
+        // cutoff so both agree on the same number. 3 consecutive
+        // bad ticks (matching bitaxe.rs's pattern) before tripping,
+        // so one noisy I2C read doesn't kill a healthy board.
+        const EMERGENCY_TEMP_C: f32 = 75.0;
+        const BAD_READING_LIMIT: u32 = 3;
+        let mut consecutive_hot = 0u32;
 
         loop {
             tokio::select! {
@@ -807,6 +846,33 @@ fn spawn_monitor(
                     name: name.to_string(),
                     temperature: reading,
                 });
+            }
+
+            match hottest_c(&temperatures) {
+                Some(hottest) if hottest >= EMERGENCY_TEMP_C => {
+                    consecutive_hot += 1;
+                    warn!(
+                        hottest_c = hottest,
+                        consecutive = consecutive_hot,
+                        "Temperature above emergency threshold"
+                    );
+                }
+                _ => consecutive_hot = 0,
+            }
+
+            if consecutive_hot >= BAD_READING_LIMIT {
+                error!(
+                    consecutive = consecutive_hot,
+                    "THERMAL EMERGENCY: cutting chain power"
+                );
+                if let Err(e) = thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
+                    warn!(error = %e, "Failed to signal hash threads during thermal emergency");
+                }
+                chain_state.lock().await.disable_all().await;
+                if let Err(e) = psu_nen_pin.lock().await.write(PinValue::High).await {
+                    error!(error = %e, "Failed to disable PSU output during thermal emergency");
+                }
+                break;
             }
 
             // APW12 has no current sense — watts are always an estimate
@@ -847,7 +913,7 @@ fn spawn_monitor(
 /// Antminer S19K Pro board state, held for the board's lifetime.
 struct AntminerS19kAm3 {
     chain_state: SharedChainStateHandle,
-    psu_nen_pin: SysfsGpioPin,
+    psu_nen_pin: Arc<Mutex<SysfsGpioPin>>,
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
     monitor_cancel: CancellationToken,
     monitor_task: tokio::task::JoinHandle<()>,
@@ -867,7 +933,7 @@ impl AntminerS19kAm3 {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
         self.chain_state.lock().await.disable_all().await;
-        let _ = self.psu_nen_pin.write(PinValue::High).await; // disable PSU output
+        let _ = self.psu_nen_pin.lock().await.write(PinValue::High).await; // disable PSU output
     }
 }
 
@@ -945,5 +1011,38 @@ mod power_config_tests {
             std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
             std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
         }
+    }
+}
+
+#[cfg(test)]
+mod hottest_c_tests {
+    use super::*;
+
+    fn sensor(name: &str, temp_c: Option<f32>) -> TemperatureSensor {
+        TemperatureSensor {
+            name: name.to_string(),
+            temperature: temp_c.map(Temperature::from_celsius),
+        }
+    }
+
+    #[test]
+    fn no_sensors_is_none() {
+        assert_eq!(hottest_c(&[]), None);
+    }
+
+    #[test]
+    fn all_failed_reads_is_none() {
+        let readings = [sensor("a", None), sensor("b", None)];
+        assert_eq!(hottest_c(&readings), None);
+    }
+
+    #[test]
+    fn picks_hottest_ignoring_failed_reads() {
+        let readings = [
+            sensor("a", Some(40.0)),
+            sensor("b", None),
+            sensor("c", Some(61.6)),
+        ];
+        assert_eq!(hottest_c(&readings), Some(61.6));
     }
 }
