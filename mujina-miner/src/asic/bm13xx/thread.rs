@@ -222,6 +222,14 @@ pub enum ChipInitStrategy {
         /// source. `None` stays at the discovery-time 115200 baud
         /// throughout.
         baud_control: Option<Box<dyn BaudControl>>,
+        /// Chip clock the frequency ramp climbs to, in MHz. Was a
+        /// compile-time 575.0 const in this module until callers could
+        /// only change it by editing and recompiling -- the caller
+        /// (`board/antminer_s19k_am3.rs`) is responsible for validating
+        /// this against a known-safe envelope before constructing the
+        /// strategy; this module only rejects values `calculate_pll_bm1366`
+        /// can't find a valid PLL divider chain for.
+        target_frequency_mhz: f32,
     },
 }
 
@@ -324,11 +332,13 @@ where
             chip_count,
             domain_config,
             baud_control,
+            target_frequency_mhz,
         } => {
             initialize_chip_bm1366_chain(
                 *chip_count,
                 domain_config,
                 baud_control.as_deref(),
+                *target_frequency_mhz,
                 chip_commands,
                 peripherals,
                 asic_difficulty,
@@ -636,6 +646,7 @@ async fn initialize_chip_bm1366_chain<W>(
     chip_count: u8,
     domain_config: &[DomainConfigWrite],
     baud_control: Option<&dyn BaudControl>,
+    target_frequency_mhz: f32,
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
@@ -926,27 +937,29 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    // Frequency ramp -- deliberately last. Targets 575MHz: the
-    // reference's own real hardware measurement on this exact chip
+    // Frequency ramp -- deliberately last. Default target is 575MHz:
+    // the reference's own real hardware measurement on this exact chip
     // family (39.68 TH/s on mujina itself, LuxOS gets 39.15-39.33
     // TH/s at the same point) -- deliberately not the 645MHz factory
     // ceiling, which their notes call "right at the edge of
     // stability" (645MHz measured *less* hashrate than 575MHz).
-    const TARGET_MHZ: f32 = 575.0;
+    // `target_frequency_mhz` is caller-supplied (see
+    // `ChipInitStrategy::Bm1366Chain`) rather than hardcoded here so a
+    // lower-power operating point doesn't need a recompile.
     const RAMP_STEP_MHZ: f32 = 6.25;
     const RAMP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
     debug!(
-        target_mhz = TARGET_MHZ,
+        target_mhz = target_frequency_mhz,
         step_mhz = RAMP_STEP_MHZ,
         "Ramping frequency"
     );
     let mut mhz = 56.25f32;
     loop {
-        mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
+        mhz = if mhz + RAMP_STEP_MHZ < target_frequency_mhz {
             mhz + RAMP_STEP_MHZ
         } else {
-            TARGET_MHZ
+            target_frequency_mhz
         };
         let pll = calculate_pll_bm1366(mhz)
             .with_context(|| format!("no valid BM1366 PLL config for {mhz}MHz"))?;
@@ -954,7 +967,7 @@ where
             .await
             .with_context(|| format!("failed to send PllDivider for {mhz}MHz ramp step"))?;
         tokio::time::sleep(RAMP_STEP_DELAY).await;
-        if mhz >= TARGET_MHZ {
+        if mhz >= target_frequency_mhz {
             break;
         }
     }

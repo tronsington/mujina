@@ -58,8 +58,8 @@ use crate::{
     },
     hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue},
     linux_hw::{BitBangI2c, LinuxI2c, SysfsGpio, SysfsGpioPin},
-    power_estimate::PowerEstimateInput,
     peripheral::{apw12::Apw12, tmp1075::Tmp1075},
+    power_estimate::PowerEstimateInput,
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialStream},
 };
@@ -109,20 +109,21 @@ const PSU_NEN_OFFSET: u8 = 26;
 const PSU_SCL_GPIO: u32 = 476;
 const PSU_SDA_GPIO: u32 = 477;
 
-/// Real target output voltage. `bosminer`'s own PSU ramp log (Round
-/// 3) confirmed 15.2V as its initial *bring-up* ceiling, but Round
-/// 14's investigation found that's not the real sustained-operation
-/// target: a community fork (github.com/Schnitzel/mujina,
-/// amlogic-s19kpro-support branch) documents Braiins' own bosminer
-/// reporting this exact hashboard model's (BHB56902) factory ATE
-/// setpoint directly (`Detected hashboard #2: Voltage (Avg.) 13.90 V,
-/// Frequency (Avg.) 645 MHz`), and their own real hardware testing
-/// confirms real sustained hashing at that voltage. Every Round 14
-/// test that failed above 300MHz ran the entire time at the 15.2V
-/// bring-up ceiling, never adjusted down -- this may have been
-/// silently starving or destabilizing the PLL, independent of the
-/// PLL divider math itself.
-const PSU_TARGET_VOLTS: f32 = 13.9;
+/// Default real target output voltage. `bosminer`'s own PSU ramp log
+/// (Round 3) confirmed 15.2V as its initial *bring-up* ceiling, but
+/// Round 14's investigation found that's not the real
+/// sustained-operation target: a community fork
+/// (github.com/Schnitzel/mujina, amlogic-s19kpro-support branch)
+/// documents Braiins' own bosminer reporting this exact hashboard
+/// model's (BHB56902) factory ATE setpoint directly (`Detected
+/// hashboard #2: Voltage (Avg.) 13.90 V, Frequency (Avg.) 645 MHz`),
+/// and their own real hardware testing confirms real sustained hashing
+/// at that voltage. Every Round 14 test that failed above 300MHz ran
+/// the entire time at the 15.2V bring-up ceiling, never adjusted down
+/// -- this may have been silently starving or destabilizing the PLL,
+/// independent of the PLL divider math itself. Overridable via
+/// `MUJINA_ANTMINER_S19K_VOLTAGE` -- see [`PowerConfig`].
+const DEFAULT_VOLTAGE_V: f32 = 13.9;
 const PSU_RAMP_STEP_VOLTS: f32 = 0.5;
 const PSU_RAMP_STEP_DELAY: Duration = Duration::from_millis(1500);
 
@@ -135,12 +136,89 @@ const SENSOR_I2C_DEVICE: &str = "/dev/i2c-1";
 /// Expected chips per chain (S19K Pro AM3 hashboards).
 pub(crate) const EXPECTED_CHIPS: usize = 77;
 
-/// Chip clock the hash-thread ramp currently targets.
+/// Default chip clock the hash-thread ramp targets, overridable via
+/// `MUJINA_ANTMINER_S19K_FREQUENCY_MHZ` -- see [`PowerConfig`].
+const DEFAULT_FREQUENCY_MHZ: f32 = 575.0;
+
+/// Runtime-configurable frequency/voltage operating point, read once at
+/// board bring-up.
 ///
-/// Compile-time today (`asic/bm13xx/thread.rs`); exposed on telemetry so
-/// the power model and API agree. Runtime frequency control will make
-/// this a live value.
-const OPERATING_FREQUENCY_MHZ: f32 = 575.0;
+/// Both were compile-time consts until this landed -- editing the
+/// reference TOML's `initial_voltage` or relabeling a binary did
+/// nothing, because nothing in the daemon actually read them (see the
+/// mujina channel thread on 2026-08-28: a "450MHz" one-off build never
+/// changed frequency, and a `12.0V`-at-575MHz combo dropped chip
+/// verify because nothing validated the pair against a known-safe
+/// envelope). Range is bosminer's own continuous-tuning grid for this
+/// exact 3x77-chip unit (`docs/s19k-pro/power-controls.md`: 1560-2760W
+/// spanning 12.00-13.11V CT setpoints, 251-693MHz chip range) plus this
+/// driver's own confirmed 575MHz/13.9V operating point, rounded out
+/// with headroom -- not an arbitrary clamp. 645MHz is documented as
+/// "right at the edge of stability" (see `thread.rs`'s frequency-ramp
+/// comment), so the max sits just above it rather than at some
+/// untested ceiling. Out-of-range requests are clamped and logged
+/// rather than silently accepted or rejected outright, matching this
+/// codebase's existing `CpuMinerConfig` pattern.
+#[derive(Debug, Clone, Copy)]
+struct PowerConfig {
+    frequency_mhz: f32,
+    voltage_v: f32,
+}
+
+impl PowerConfig {
+    const MIN_FREQUENCY_MHZ: f32 = 200.0;
+    const MAX_FREQUENCY_MHZ: f32 = 650.0;
+    const MIN_VOLTAGE_V: f32 = 12.0;
+    const MAX_VOLTAGE_V: f32 = 14.0;
+
+    fn from_env() -> Self {
+        Self {
+            frequency_mhz: env_f32_clamped(
+                "MUJINA_ANTMINER_S19K_FREQUENCY_MHZ",
+                DEFAULT_FREQUENCY_MHZ,
+                Self::MIN_FREQUENCY_MHZ,
+                Self::MAX_FREQUENCY_MHZ,
+            ),
+            voltage_v: env_f32_clamped(
+                "MUJINA_ANTMINER_S19K_VOLTAGE",
+                DEFAULT_VOLTAGE_V,
+                Self::MIN_VOLTAGE_V,
+                Self::MAX_VOLTAGE_V,
+            ),
+        }
+    }
+}
+
+/// Parse an f32 from environment variable `var`, falling back to
+/// `default` when unset or unparseable, and clamping the result to
+/// `[min, max]`. Logs a warning whenever the requested value isn't the
+/// one actually used, so a bad or out-of-envelope setting is visible in
+/// the daemon's own logs rather than silently taking effect (or not).
+fn env_f32_clamped(var: &str, default: f32, min: f32, max: f32) -> f32 {
+    let value = match std::env::var(var) {
+        Ok(raw) => match raw.parse::<f32>() {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(var, raw, error = %e, default, "invalid value, using default");
+                return default;
+            }
+        },
+        Err(_) => return default,
+    };
+
+    let clamped = value.clamp(min, max);
+    if clamped != value {
+        warn!(
+            var,
+            requested = value,
+            clamped,
+            min,
+            max,
+            "requested value outside safe range, clamped"
+        );
+    }
+    clamped
+}
 
 /// Per-chip addressed `IoDriverStrength`(`0x58`)/`UartRelay`(`0x2C`)
 /// writes, captured verbatim from a real successful bring-up (chain
@@ -271,6 +349,13 @@ impl BaudControl for SerialControl {
 }
 
 async fn create_board() -> Result<BackplaneConnector> {
+    let power_config = PowerConfig::from_env();
+    info!(
+        frequency_mhz = power_config.frequency_mhz,
+        voltage_v = power_config.voltage_v,
+        "Power config"
+    );
+
     let mut chain_gpio = SysfsGpio::new(GPIO_BASE);
 
     let mut pins = Vec::with_capacity(CHAIN_ENABLE_OFFSETS.len());
@@ -327,7 +412,14 @@ async fn create_board() -> Result<BackplaneConnector> {
     // Chip counts also feed the APW12 power estimate in spawn_monitor.
     // If discovery fails we fall back to the expected full population
     // so the API still has a labeled estimate when voltage is readable.
-    let chip_counts = match power_up_and_validate(&mut psu, &mut psu_nen_pin, &chain_state).await {
+    let chip_counts = match power_up_and_validate(
+        &mut psu,
+        &mut psu_nen_pin,
+        &chain_state,
+        power_config.voltage_v,
+    )
+    .await
+    {
         Ok(counts) => {
             for (chain, count) in counts.iter().enumerate() {
                 if *count == EXPECTED_CHIPS {
@@ -363,7 +455,7 @@ async fn create_board() -> Result<BackplaneConnector> {
         name: info.serial_number.clone().unwrap(),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
-        frequency_mhz: Some(OPERATING_FREQUENCY_MHZ),
+        frequency_mhz: Some(power_config.frequency_mhz),
         chip_count: Some(discovered_chips),
         ..Default::default()
     };
@@ -376,6 +468,7 @@ async fn create_board() -> Result<BackplaneConnector> {
         telemetry_tx,
         cancel.clone(),
         discovered_chips,
+        power_config.frequency_mhz,
     );
 
     // One BM13xxThread per chain, each with its own real serial
@@ -417,6 +510,7 @@ async fn create_board() -> Result<BackplaneConnector> {
                 chip_count: EXPECTED_CHIPS as u8,
                 domain_config: DOMAIN_CONFIG_WRITES,
                 baud_control: Some(Box::new(control)),
+                target_frequency_mhz: power_config.frequency_mhz,
             },
         );
         threads.push(Box::new(thread));
@@ -454,6 +548,7 @@ async fn power_up_and_validate(
     psu: &mut Apw12<BitBangI2c>,
     psu_nen_pin: &mut SysfsGpioPin,
     chain_state: &SharedChainStateHandle,
+    target_volts: f32,
 ) -> Result<[usize; 3]> {
     psu.disable_watchdog()
         .await
@@ -465,7 +560,7 @@ async fn power_up_and_validate(
         .await
         .context("enabling PSU output (PSU_nEN low)")?;
 
-    ramp_psu_voltage(psu, PSU_TARGET_VOLTS).await?;
+    ramp_psu_voltage(psu, target_volts).await?;
 
     // Same idempotent reset any hash thread's own lazy init would
     // trigger (see SharedChainEnable) -- whichever runs first, this
@@ -676,6 +771,7 @@ fn spawn_monitor(
     telemetry_tx: watch::Sender<BoardTelemetry>,
     cancel: CancellationToken,
     chip_count: u32,
+    frequency_mhz: f32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INTERVAL: Duration = Duration::from_secs(5);
@@ -718,7 +814,7 @@ fn spawn_monitor(
             let power = match psu.measure_voltage().await {
                 Ok(voltage) => {
                     let estimated_w = PowerEstimateInput {
-                        frequency_mhz: OPERATING_FREQUENCY_MHZ,
+                        frequency_mhz,
                         rail_volts: voltage,
                         chip_count,
                     }
@@ -739,7 +835,7 @@ fn spawn_monitor(
             };
 
             telemetry_tx.send_modify(|t| {
-                t.frequency_mhz = Some(OPERATING_FREQUENCY_MHZ);
+                t.frequency_mhz = Some(frequency_mhz);
                 t.chip_count = Some(chip_count);
                 t.temperatures = temperatures;
                 t.powers = power.into_iter().collect();
@@ -772,5 +868,82 @@ impl AntminerS19kAm3 {
         let _ = (&mut self.monitor_task).await;
         self.chain_state.lock().await.disable_all().await;
         let _ = self.psu_nen_pin.write(PinValue::High).await; // disable PSU output
+    }
+}
+
+#[cfg(test)]
+mod power_config_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn from_env_defaults_when_unset() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+            std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, DEFAULT_FREQUENCY_MHZ);
+        assert_eq!(config.voltage_v, DEFAULT_VOLTAGE_V);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_clamps_out_of_range_requests() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ", "900");
+            std::env::set_var("MUJINA_ANTMINER_S19K_VOLTAGE", "0.5");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, PowerConfig::MAX_FREQUENCY_MHZ);
+        assert_eq!(config.voltage_v, PowerConfig::MIN_VOLTAGE_V);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+            std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_falls_back_to_default_on_garbage_input() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ", "not-a-number");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, DEFAULT_FREQUENCY_MHZ);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_accepts_values_within_range() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ", "450");
+            std::env::set_var("MUJINA_ANTMINER_S19K_VOLTAGE", "12.3");
+        }
+
+        let config = PowerConfig::from_env();
+        assert_eq!(config.frequency_mhz, 450.0);
+        assert_eq!(config.voltage_v, 12.3);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::remove_var("MUJINA_ANTMINER_S19K_FREQUENCY_MHZ");
+            std::env::remove_var("MUJINA_ANTMINER_S19K_VOLTAGE");
+        }
     }
 }
