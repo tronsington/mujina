@@ -176,9 +176,10 @@ const GROUPS: &[EnvGroup] = &[
             EnvVar {
                 name: "MUJINA_ANTMINER_S19K_VOLTAGE",
                 summary: "PSU output voltage setpoint for the S19K Pro AM3. \
-                          Clamped to 12.0-14.0V (bosminer's confirmed \
-                          continuous-tuning envelope for this hashboard) and \
-                          logged if out of range.",
+                          Clamped to 12.0-15.2V (bosminer's confirmed \
+                          continuous-tuning envelope plus its bring-up \
+                          ceiling for this hashboard) and logged if out of \
+                          range.",
                 default: Some("13.9"),
                 example: Some("12.3"),
             },

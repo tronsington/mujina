@@ -160,6 +160,16 @@ const DEFAULT_FREQUENCY_MHZ: f32 = 575.0;
 /// untested ceiling. Out-of-range requests are clamped and logged
 /// rather than silently accepted or rejected outright, matching this
 /// codebase's existing `CpuMinerConfig` pattern.
+///
+/// Voltage ceiling raised 14.0 -> 15.2V on 2026-08-28 (mujina channel
+/// thread) to retest the one operating point this driver has ever
+/// actually hashed at: 300MHz/15.2V, confirmed real in Round 12-14
+/// (`docs/s19k-pro/reference/full-engineering-log.md`) before later
+/// rounds moved to bosminer's 13.9V factory setpoint. 15.2V is
+/// bosminer's own confirmed bring-up ceiling for this exact hashboard,
+/// not an untested value -- but it is above the reference port's own
+/// 13.9-14.5V range (`docs/s19k-pro/power-controls.md`), so treat it as
+/// a temporary widening for this test, not a new steady-state default.
 #[derive(Debug, Clone, Copy)]
 struct PowerConfig {
     frequency_mhz: f32,
@@ -170,7 +180,7 @@ impl PowerConfig {
     const MIN_FREQUENCY_MHZ: f32 = 200.0;
     const MAX_FREQUENCY_MHZ: f32 = 650.0;
     const MIN_VOLTAGE_V: f32 = 12.0;
-    const MAX_VOLTAGE_V: f32 = 14.0;
+    const MAX_VOLTAGE_V: f32 = 15.2;
 
     fn from_env() -> Self {
         Self {
