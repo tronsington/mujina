@@ -64,11 +64,21 @@ POOL_POLL_S = 30
 HISTORY_MAX = 2400  # ~2h at 3s
 
 # APW12 exposes no current or power reading (only voltage setpoint,
-# measured voltage, and on/off state), so wattage cannot be measured.
-# This is the nameplate efficiency used to *estimate* it:
-# 120 TH/s @ 2760 W = 23.0 J/TH, scaled by (V/13.9)^2.
-NAMEPLATE_J_PER_TH = 23.0
+# measured voltage, and on/off state), so wattage cannot be measured
+# in software. Prefer firmware-reported powers[].power_w when the
+# miner labels it (source=estimated|measured). Otherwise fall back to
+# the same CMOS forward model mujina now ships in power_estimate.rs:
+#   P_ac ≈ (P_asic_dc_nom · (N/231) · (f/645) · (V/13.9)² + 150) / 0.93
+# with P_asic_dc_nom = 2760*0.93 - 150. The old circular hashrate×J/TH
+# figure is kept only as a last resort.
+NAMEPLATE_POWER_W = 2760.0
+NAMEPLATE_J_PER_TH = 23.0  # 2760 / 120 — documented for the UI
 NOMINAL_VOLTS = 13.9
+NOMINAL_FREQUENCY_MHZ = 645.0
+NOMINAL_CHIP_COUNT = 231
+OPERATING_FREQUENCY_MHZ = 575.0  # current compile-time ramp target
+FANS_AND_CONTROL_W = 150.0
+PSU_EFFICIENCY = 0.93
 
 # Each reported nonce represents 2^34 hashes at TicketMask zero_bits=2.
 HASHES_PER_NONCE = 2 ** 34
@@ -100,6 +110,49 @@ def _pool_query(promql, timeout=12):
 # ------------------------------------------------------------ collectors
 
 
+def _forward_model_watts(volts, frequency_mhz, chip_count):
+    """CMOS forward model matching mujina-miner/src/power_estimate.rs."""
+    if not volts or volts <= 0 or not frequency_mhz or frequency_mhz <= 0:
+        return None
+    if not chip_count or chip_count <= 0:
+        return None
+    p_asic_dc_nom = NAMEPLATE_POWER_W * PSU_EFFICIENCY - FANS_AND_CONTROL_W
+    n_scale = chip_count / NOMINAL_CHIP_COUNT
+    f_scale = frequency_mhz / NOMINAL_FREQUENCY_MHZ
+    v_scale = volts / NOMINAL_VOLTS
+    asic_dc = p_asic_dc_nom * n_scale * f_scale * (v_scale ** 2)
+    return (asic_dc + FANS_AND_CONTROL_W) / PSU_EFFICIENCY
+
+
+def _estimate_watts(snap):
+    """Return (watts, source_label). Prefer firmware, then forward model."""
+    if snap.get("fw_power_w") is not None:
+        src = snap.get("fw_power_source") or "firmware"
+        return snap["fw_power_w"], src
+
+    volts = snap.get("volts")
+    freq = snap.get("frequency_mhz") or OPERATING_FREQUENCY_MHZ
+    chips = snap.get("chip_count")
+    if chips is None:
+        # Three boards × 77 chips is the S19K Pro population; if threads
+        # are present use that as a live count proxy (1 thread ≈ 1 board).
+        n_threads = len(snap.get("threads") or [])
+        chips = (n_threads * 77) if n_threads else NOMINAL_CHIP_COUNT
+
+    model_w = _forward_model_watts(volts, freq, chips)
+    if model_w is not None:
+        return model_w, "model"
+
+    # Last resort: circular hashrate × nameplate J/TH × (V/13.9)²
+    hr = snap.get("hashrate_shares")
+    if volts and hr:
+        th_s = hr / 1e12
+        jth = NAMEPLATE_J_PER_TH * (volts / NOMINAL_VOLTS) ** 2
+        return th_s * jth, "circular"
+
+    return None, None
+
+
 def poll_miner():
     """mujina's /miner endpoint. Absence here means mujina isn't running."""
     while True:
@@ -115,16 +168,28 @@ def poll_miner():
             fans = [
                 f["rpm"] for f in (board.get("fans") or []) if f.get("rpm") is not None
             ]
+            powers = board.get("powers") or []
             volts = [
                 p["voltage_v"]
-                for p in (board.get("powers") or [])
+                for p in powers
                 if p.get("voltage_v") is not None
             ]
+            # Prefer a firmware power reading (estimated or measured).
+            fw_power_w = None
+            fw_power_source = None
+            for p in powers:
+                if p.get("power_w") is not None:
+                    fw_power_w = p["power_w"]
+                    fw_power_source = p.get("source") or "firmware"
+                    break
 
             sources = d.get("sources") or []
             difficulty = next(
                 (s.get("difficulty") for s in sources if s.get("difficulty")), None
             )
+
+            frequency_mhz = board.get("frequency_mhz")
+            chip_count = board.get("chip_count")
 
             snap = {
                 "t": time.time(),
@@ -140,6 +205,10 @@ def poll_miner():
                 "temp_max": max(temps) if temps else None,
                 "fans": fans,
                 "volts": volts[0] if volts else None,
+                "frequency_mhz": frequency_mhz,
+                "chip_count": chip_count,
+                "fw_power_w": fw_power_w,
+                "fw_power_source": fw_power_source,
                 "threads": [
                     {
                         "name": th.get("name"),
@@ -172,12 +241,9 @@ def poll_miner():
                         snap["hashrate_shares"] = (
                             dshares / dt * difficulty * (2 ** 32)
                         )
-                est_w = None
-                if snap["volts"] and snap.get("hashrate_shares"):
-                    th_s = snap["hashrate_shares"] / 1e12
-                    jth = NAMEPLATE_J_PER_TH * (snap["volts"] / NOMINAL_VOLTS) ** 2
-                    est_w = th_s * jth
+                est_w, est_source = _estimate_watts(snap)
                 snap["est_watts"] = est_w
+                snap["power_source"] = est_source
                 _state["miner"] = snap
                 _state["miner_error"] = None
                 _state["history"].append(snap)
@@ -458,6 +524,8 @@ def build_state_json():
             "miner_api": MINER_API,
             "nameplate_j_per_th": NAMEPLATE_J_PER_TH,
             "nominal_volts": NOMINAL_VOLTS,
+            "nominal_frequency_mhz": NOMINAL_FREQUENCY_MHZ,
+            "operating_frequency_mhz": OPERATING_FREQUENCY_MHZ,
         },
     }
 
