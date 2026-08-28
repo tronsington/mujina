@@ -61,8 +61,14 @@ formatting and unit conversion.
 | `_v`         | volts                  |
 | `_a`         | amperes                |
 | `_w`         | watts                  |
+| `_mhz`       | megahertz              |
 | `rpm`        | revolutions per minute |
 | `hashrate`   | hashes per second      |
+
+`boards[].powers[].power_w` may be a model estimate rather than a
+metered reading. When present, `boards[].powers[].source` is either
+`measured` or `estimated` — treat `estimated` as unlabeled wall power
+only after a meter calibrates the model.
 
 Percentage fields (`percent`, `target_percent`) are integers
 0--100.

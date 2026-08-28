@@ -29,6 +29,12 @@ pub struct BoardTelemetry {
     pub name: String,
     pub model: String,
     pub serial: Option<String>,
+    /// Active chip clock in MHz, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_mhz: Option<f32>,
+    /// Chips responding / addressed on this board, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chip_count: Option<u32>,
     pub fans: Vec<Fan>,
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
@@ -56,6 +62,19 @@ pub struct TemperatureSensor {
     pub temperature: Option<Temperature>,
 }
 
+/// How a power reading was obtained.
+///
+/// On APW12 (and any PSU without current sense), watts are a model
+/// estimate — never treat [`PowerSource::Estimated`] as wall power.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerSource {
+    /// PSU or external meter reported this value.
+    Measured,
+    /// Forward model (`P ∝ N·f·V²`) — labeled estimate only.
+    Estimated,
+}
+
 /// Voltage, current, and power from a single measurement point.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct PowerMeasurement {
@@ -63,6 +82,9 @@ pub struct PowerMeasurement {
     pub voltage_v: Option<f32>,
     pub current_a: Option<f32>,
     pub power_w: Option<f32>,
+    /// Present when `power_w` is set. Clients must honour `estimated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PowerSource>,
 }
 
 /// Per-thread telemetry.

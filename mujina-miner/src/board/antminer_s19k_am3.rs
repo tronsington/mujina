@@ -46,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::{
-    api_client::types::{BoardTelemetry, PowerMeasurement, TemperatureSensor},
+    api_client::types::{BoardTelemetry, PowerMeasurement, PowerSource, TemperatureSensor},
     asic::{
         ChipInfo,
         bm13xx::{
@@ -58,6 +58,7 @@ use crate::{
     },
     hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue},
     linux_hw::{BitBangI2c, LinuxI2c, SysfsGpio, SysfsGpioPin},
+    power_estimate::PowerEstimateInput,
     peripheral::{apw12::Apw12, tmp1075::Tmp1075},
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialStream},
@@ -133,6 +134,13 @@ const SENSOR_I2C_DEVICE: &str = "/dev/i2c-1";
 
 /// Expected chips per chain (S19K Pro AM3 hashboards).
 pub(crate) const EXPECTED_CHIPS: usize = 77;
+
+/// Chip clock the hash-thread ramp currently targets.
+///
+/// Compile-time today (`asic/bm13xx/thread.rs`); exposed on telemetry so
+/// the power model and API agree. Runtime frequency control will make
+/// this a live value.
+const OPERATING_FREQUENCY_MHZ: f32 = 575.0;
 
 /// Per-chip addressed `IoDriverStrength`(`0x58`)/`UartRelay`(`0x2C`)
 /// writes, captured verbatim from a real successful bring-up (chain
@@ -315,9 +323,13 @@ async fn create_board() -> Result<BackplaneConnector> {
     // failure here is deliberately non-fatal, since temperature/PSU
     // telemetry and the hash threads created below are independently
     // useful even if this early check has a bad run.
-    match power_up_and_validate(&mut psu, &mut psu_nen_pin, &chain_state).await {
-        Ok(chip_counts) => {
-            for (chain, count) in chip_counts.iter().enumerate() {
+    //
+    // Chip counts also feed the APW12 power estimate in spawn_monitor.
+    // If discovery fails we fall back to the expected full population
+    // so the API still has a labeled estimate when voltage is readable.
+    let chip_counts = match power_up_and_validate(&mut psu, &mut psu_nen_pin, &chain_state).await {
+        Ok(counts) => {
+            for (chain, count) in counts.iter().enumerate() {
                 if *count == EXPECTED_CHIPS {
                     info!(chain = chain + 1, chips = count, "Chain discovery OK");
                 } else {
@@ -329,11 +341,14 @@ async fn create_board() -> Result<BackplaneConnector> {
                     );
                 }
             }
+            counts
         }
         Err(e) => {
             warn!(error = ?e, "Chain power-up/discovery failed");
+            [EXPECTED_CHIPS; 3]
         }
-    }
+    };
+    let discovered_chips: u32 = chip_counts.iter().map(|&c| c as u32).sum();
 
     let info = BoardInfo {
         model: "Antminer S19K Pro (AM3)".to_string(),
@@ -348,12 +363,20 @@ async fn create_board() -> Result<BackplaneConnector> {
         name: info.serial_number.clone().unwrap(),
         model: info.model.clone(),
         serial: info.serial_number.clone(),
+        frequency_mhz: Some(OPERATING_FREQUENCY_MHZ),
+        chip_count: Some(discovered_chips),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
 
     let cancel = CancellationToken::new();
-    let monitor_task = spawn_monitor(temp_sensors, psu, telemetry_tx, cancel.clone());
+    let monitor_task = spawn_monitor(
+        temp_sensors,
+        psu,
+        telemetry_tx,
+        cancel.clone(),
+        discovered_chips,
+    );
 
     // One BM13xxThread per chain, each with its own real serial
     // connection but sharing the same idempotent chain-enable/reset
@@ -652,6 +675,7 @@ fn spawn_monitor(
     mut psu: Apw12<BitBangI2c>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
     cancel: CancellationToken,
+    chip_count: u32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INTERVAL: Duration = Duration::from_secs(5);
@@ -689,13 +713,25 @@ fn spawn_monitor(
                 });
             }
 
+            // APW12 has no current sense — watts are always an estimate
+            // (same class as Braiins/LuxOS on this PSU). Label them.
             let power = match psu.measure_voltage().await {
-                Ok(voltage) => Some(PowerMeasurement {
-                    name: "psu".to_string(),
-                    voltage_v: Some(voltage),
-                    current_a: None,
-                    power_w: None,
-                }),
+                Ok(voltage) => {
+                    let estimated_w = PowerEstimateInput {
+                        frequency_mhz: OPERATING_FREQUENCY_MHZ,
+                        rail_volts: voltage,
+                        chip_count,
+                    }
+                    .estimate()
+                    .map(|e| e.ac_watts);
+                    Some(PowerMeasurement {
+                        name: "psu".to_string(),
+                        voltage_v: Some(voltage),
+                        current_a: None,
+                        power_w: estimated_w,
+                        source: estimated_w.map(|_| PowerSource::Estimated),
+                    })
+                }
                 Err(e) => {
                     warn!(error = %e, "PSU voltage read failed");
                     None
@@ -703,6 +739,8 @@ fn spawn_monitor(
             };
 
             telemetry_tx.send_modify(|t| {
+                t.frequency_mhz = Some(OPERATING_FREQUENCY_MHZ);
+                t.chip_count = Some(chip_count);
                 t.temperatures = temperatures;
                 t.powers = power.into_iter().collect();
             });

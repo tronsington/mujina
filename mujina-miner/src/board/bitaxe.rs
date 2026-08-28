@@ -393,6 +393,8 @@ impl Bitaxe {
             name: self.board_name.clone(),
             model: self.board_model.into(),
             serial: self.board_serial.clone(),
+            frequency_mhz: None,
+            chip_count: None,
             fans: vec![Fan {
                 name: "fan".into(),
                 rpm: fan_rpm,
@@ -415,12 +417,14 @@ impl Bitaxe {
                     voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
                     current_a: None,
                     power_w: None,
+                    source: None,
                 },
                 PowerMeasurement {
                     name: "core".into(),
                     voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
                     current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
                     power_w: power_mw.map(|mw| mw as f32 / 1000.0),
+                    source: power_mw.map(|_| crate::api_client::types::PowerSource::Measured),
                 },
             ],
             threads: Vec::new(), // TODO: populate from hash thread telemetry
