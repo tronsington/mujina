@@ -1,40 +1,34 @@
 //! CRC validation utilities for BM13xx protocol frames.
 
-use crc_all::CrcAlgo;
-
 /// Calculates a 5-bit CRC using the USB polynomial over a slice of bytes.
 ///
-/// This function implements the CRC-5-USB algorithm which uses polynomial 0x05,
+/// This function implements the CRC-5 algorithm which uses polynomial 0x05,
 /// an initial value of 0x1f, no output XOR. The algorithm does not use bit reflection.
 ///
 /// Note that while CRCs are conceptually bit-oriented operations, this implementation
 /// processes data in byte-sized chunks. The CRC is calculated over the entire sequence
 /// of bits in the provided bytes.
 pub fn crc5(data: &[u8]) -> u8 {
-    let mut crc = CRC5_INIT;
-    CRC5.update_crc(&mut crc, data);
-    CRC5.finish_crc(&crc)
+    let mut crc: u8 = 0x1f;
+    for &byte in data {
+        for i in (0..8).rev() {
+            let bit = (byte >> i) & 1;
+            let top = (crc >> 4) & 1;
+            crc = ((crc << 1) & 0x1f) ^ if top ^ bit != 0 { 0x05 } else { 0 };
+        }
+    }
+    crc
 }
 
-/// Validates data integrity using the CRC-5-USB algorithm.
+/// Validates data integrity using the CRC-5 algorithm.
 ///
-/// This function checks if the data passes CRC validation by calculating the CRC-5
-/// and verifying that the result is zero. When a CRC is appended to data, the CRC
-/// calculation over the entire data (including the CRC) should yield zero if the data
-/// is valid.
+/// This function checks whether the data passes CRC validation by
+/// calculating the CRC-5 and verifying that the result is zero. Such a
+/// check holds for CRC-5 when the CRC is appended as the final bits of
+/// the data.
 pub fn crc5_is_valid(data: &[u8]) -> bool {
     crc5(data) == 0
 }
-
-const CRC5_INIT: u8 = 0x1f;
-
-const CRC5: CrcAlgo<u8> = CrcAlgo::<u8>::new(
-    0x5,       // polynomial
-    5,         // width
-    CRC5_INIT, // init
-    0,         // xorout
-    false,     // reflect
-);
 
 /// Calculates a 16-bit CRC using the CRC-16-FALSE algorithm over a slice of bytes.
 ///
@@ -44,30 +38,23 @@ const CRC5: CrcAlgo<u8> = CrcAlgo::<u8>::new(
 /// - No output XOR
 /// - No bit reflection
 pub fn crc16(data: &[u8]) -> u16 {
-    let mut crc = CRC16_INIT;
-    CRC16.update_crc(&mut crc, data);
-    CRC16.finish_crc(&crc)
+    let mut crc: u16 = 0xffff;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
 }
-
-const CRC16_INIT: u16 = 0xFFFF;
-
-const CRC16: CrcAlgo<u16> = CrcAlgo::<u16>::new(
-    0x1021,     // polynomial (CRC-16-CCITT-FALSE)
-    16,         // width
-    CRC16_INIT, // init
-    0,          // xorout
-    false,      // reflect
-);
 
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
-
-    // TODO: Add unit tests based on actual serial captures
-    // - Import frames from ~/mujina/captures/bitaxe-gamma-logic/esp-miner-boot.csv
-    // - Test CRC16 big-endian validation for work frames
-    // - Test CRC5 validation for response frames
-    // - Add test cases for edge cases discovered during capture analysis
 
     // Test that a computed CRC5 matches that of a few frames known to be good, taken from the
     // esp-miner source code. Skip the first two bytes, which are a prefix, and the last byte,
@@ -81,21 +68,53 @@ mod tests {
     #[test_case(&[0x55, 0xaa, 0x40, 0x05, 0x08, 0x00, 0x07]; "set_chip_address_08")]
     #[test_case(&[0x55, 0xaa, 0x53, 0x05, 0x00, 0x00, 0x03]; "chain_inactive")]
     #[test_case(&[0x55, 0xaa, 0x51, 0x09, 0x00, 0xa4, 0x90, 0x00, 0xff, 0xff, 0x1c]; "write_version_mask")]
-    fn calculate(frame: &[u8]) {
+    fn crc5_matches_esp_miner_frames(frame: &[u8]) {
         let crc = super::crc5(&frame[2..frame.len() - 1]);
         let expect = frame[frame.len() - 1];
         assert_eq!(crc, expect);
     }
 
-    #[test_case(&[0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x06]; "read_response")]
-    fn validate(frame: &[u8]) {
+    // Vectors computed with the crate crc_all 0.2.2.
+    #[test_case(b"123456789", 0x0f; "digits_one_to_nine")]
+    #[test_case(&[0x00, 0x00, 0x00, 0x00], 0x1b; "four_zero_bytes")]
+    #[test_case(&[0xff, 0xff, 0xff, 0xff], 0x1e; "four_ff_bytes")]
+    #[test_case(&[0xa5], 0x01; "single_byte")]
+    #[test_case(&[0xde, 0xad, 0xbe, 0xef], 0x18; "deadbeef")]
+    fn crc5_matches_reference_crate(data: &[u8], expect: u8) {
+        assert_eq!(super::crc5(data), expect);
+    }
+
+    #[test]
+    fn crc5_validates_response_frame() {
+        // Skip the two-byte preamble; validation covers the rest.
+        let frame = [0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x06];
         assert!(super::crc5_is_valid(&frame[2..]));
     }
 
     #[test]
+    fn crc5_rejects_corrupt_response_frame() {
+        // A frame with one payload byte changed.
+        let frame = [0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x01, 0x06];
+        assert!(!super::crc5_is_valid(&frame[2..]));
+    }
+
+    // The "123456789" vector is the check value for CRC-16/IBM-3740
+    // (alias CRC-16/CCITT-FALSE) in Greg Cook's catalogue; the
+    // remaining vectors were computed with crc_all 0.2.2.
+    #[test_case(b"123456789", 0x29b1; "digits_one_to_nine")]
+    #[test_case(&[0x00, 0x00, 0x00, 0x00], 0x84c0; "four_zero_bytes")]
+    #[test_case(&[0xff, 0xff, 0xff, 0xff], 0x1d0f; "four_ff_bytes")]
+    #[test_case(&[0xa5], 0x04bf; "single_byte")]
+    #[test_case(&[0xde, 0xad, 0xbe, 0xef], 0x4097; "deadbeef")]
+    fn crc16_matches_reference(data: &[u8], expect: u16) {
+        assert_eq!(super::crc16(data), expect);
+    }
+
+    #[test]
     fn crc16_matches_esp_miner_job() {
-        // Exact JobFull frame from an esp-miner capture
-        // Validates our CRC16 algorithm and byte order match reference implementation
+        // JobFull frame from an esp-miner capture. Checks the
+        // algorithm and the CRC's big-endian wire order against the
+        // reference implementation.
         let frame: Vec<u8> = vec![
             0x55, 0xaa, 0x21, 0x56, 0x18, 0x01, 0x00, 0x00, 0x00, 0x00, 0x38, 0xfa, 0x01, 0x17,
             0xdc, 0x17, 0xd6, 0x68, 0x15, 0x16, 0xab, 0x3d, 0x16, 0x42, 0xbb, 0x1f, 0xe2, 0xe2,

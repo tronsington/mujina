@@ -8,94 +8,45 @@
 //! chip responses, filters shares, and manages work assignment.
 
 use std::cmp::max;
+use std::ops::{ControlFlow, RangeInclusive};
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use bitcoin::block::Header as BlockHeader;
-use futures::{SinkExt, sink::Sink, stream::Stream};
+use futures::{SinkExt, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_stream::StreamExt;
+use tokio::time::{self, Duration, MissedTickBehavior};
 
-use super::protocol::{self, Log2Difficulty, TicketMask};
+use super::chain::Chain;
+use super::chip_config::ChipConfig;
+use super::command::{
+    ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
+    SetChipAddress, SinkError, WriteRegister,
+};
+use super::peripherals::BoardPeripherals;
+use super::reader::{Reader, ReaderChannels};
+use super::register::{
+    AdcCtrl1, AnalogMux, CoreCommand, CoreRegister, HashCountingNumber, IoDriverStrength,
+    Log2Difficulty, MidstateConfig, MiscControl, PllDivider, Register, RegisterAddress,
+    SoftResetControl, TicketMask, UartBaud,
+};
+use super::register_client::RegisterClient;
+use super::response::{NonceResponse, RegisterResponse, Response};
+use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
-        BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
-        HashThreadStatus, Share, ThreadRemovalSignal,
+        HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
     },
     tracing::prelude::*,
-    types::{Difficulty, HashRate, ShareRate},
+    types::{Difficulty, Frequency, ShareRate},
 };
-
-/// Tracks tasks sent to chip hardware, indexed by chip_job_id.
-///
-/// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
-/// HashTasks sent to the chip so we can match nonce responses back to the
-/// correct task context (EN2, ntime, etc.).
-struct ChipJobTracker {
-    tasks: [Option<HashTask>; 16],
-    next_id: u8,
-}
-
-impl ChipJobTracker {
-    fn new() -> Self {
-        Self {
-            tasks: Default::default(),
-            next_id: 0,
-        }
-    }
-
-    fn insert(&mut self, task: HashTask) -> u8 {
-        let chip_job_id = self.next_id;
-        self.tasks[chip_job_id as usize] = Some(task);
-        self.next_id = (self.next_id + 1) % (self.tasks.len() as u8);
-        chip_job_id
-    }
-
-    fn get(&self, chip_job_id: u8) -> Option<&HashTask> {
-        self.tasks
-            .get(chip_job_id as usize)
-            .and_then(|t| t.as_ref())
-    }
-
-    fn clear(&mut self) {
-        self.tasks = Default::default();
-    }
-}
-
-/// Command messages sent from scheduler to thread
-#[derive(Debug)]
-enum ThreadCommand {
-    /// Declare expected hashrate and ready the thread for work
-    Configure,
-
-    /// Update task (old shares still valid)
-    UpdateTask {
-        new_task: HashTask,
-        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
-    },
-
-    /// Replace task (old shares invalid)
-    ReplaceTask {
-        new_task: HashTask,
-        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
-    },
-
-    /// Go idle (stop hashing, low power)
-    GoIdle {
-        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
-    },
-
-    /// Shutdown the thread
-    #[expect(unused)]
-    Shutdown,
-}
 
 /// BM13xx HashThread implementation.
 ///
 /// Represents a chain of BM13xx chips as a schedulable worker. The thread
 /// manages serial communication with chips, filters shares, and reports events.
-/// Chip initialization happens lazily when first work is assigned.
+/// Chain initialization happens lazily when first work is assigned.
 pub struct BM13xxThread {
     /// Human-readable name for logging
     name: String,
@@ -116,57 +67,61 @@ pub struct BM13xxThread {
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
-    /// Thread starts with chip disabled. Chip will be initialized when first
-    /// work is assigned.
+    /// Thread starts with the chips held in reset. The chain will be
+    /// initialized when first work is assigned.
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
+    /// * `config` - Chip model configuration (identity, PLL parameters)
+    /// * `topology` - The board's declared chip wiring
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
-    /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
-    /// * `removal_rx` - Watch channel for board-triggered removal
-    /// * `init_strategy` - How to bring this chip/chain up on first work
-    ///   assignment (register sequence, addressing scheme) -- different
-    ///   chip families/topologies need genuinely different sequences,
-    ///   not just different tuning constants.
+    /// * `peripherals` - Hardware interfaces from board (reset line, regulator, etc.)
+    /// * `shutdown_rx` - Shutdown signal from the board; a send or a
+    ///   dropped sender requests shutdown
+    /// * `bring_up_override` - Skip the shared, config-driven bring-up
+    ///   in favor of a board-supplied sequence. `None` for every board
+    ///   whose real captured wire behavior fits `ChipConfig`/`TopologySpec`
+    ///   (Bitaxe Gamma today). See [`Bm1366ChainBringUp`] for the one
+    ///   board that doesn't yet.
+    #[expect(clippy::too_many_arguments)]
     pub fn new<R, W>(
         name: String,
+        config: ChipConfig,
+        topology: TopologySpec,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
-        removal_rx: watch::Receiver<ThreadRemovalSignal>,
-        init_strategy: ChipInitStrategy,
+        shutdown_rx: watch::Receiver<()>,
+        bring_up_override: Option<Bm1366ChainBringUp>,
     ) -> Self
     where
-        R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
-        W: Sink<protocol::Command> + Unpin + Send + 'static,
-        W::Error: std::fmt::Debug,
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
     {
-        let (cmd_tx, cmd_rx) = mpsc::channel(10);
-        let (evt_tx, evt_rx) = mpsc::channel(100);
+        let (command_tx, command_rx) = mpsc::channel(10);
+        let (event_tx, event_rx) = mpsc::channel(100);
 
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
-        let status_clone = Arc::clone(&status);
 
-        // Spawn the actor task
-        tokio::spawn(async move {
-            bm13xx_thread_actor(
-                cmd_rx,
-                evt_tx,
-                removal_rx,
-                status_clone,
-                chip_responses,
-                chip_commands,
-                peripherals,
-                init_strategy,
-            )
-            .await;
-        });
+        let (reader, channels) = Reader::spawn(chip_responses);
+        let actor = Actor::new(
+            config,
+            topology,
+            event_tx,
+            Arc::clone(&status),
+            chip_commands,
+            peripherals,
+            reader,
+            bring_up_override,
+        );
+        tokio::spawn(actor.run(command_rx, shutdown_rx, channels));
 
         Self {
             name,
-            command_tx: cmd_tx,
-            event_rx: Some(evt_rx),
+            command_tx,
+            event_rx: Some(event_rx),
             capabilities: HashThreadCapabilities::default(),
             status,
         }
@@ -175,54 +130,44 @@ impl BM13xxThread {
 
 /// A single per-chip addressed register write: (chip_address,
 /// register_address, raw 4-byte wire data). Used by
-/// [`ChipInitStrategy::Bm1366Chain`] to replay a captured domain
-/// config table verbatim -- see `board/antminer_s19k_am3.rs` for
-/// where these values come from.
-pub type DomainConfigWrite = (u8, protocol::RegisterAddress, [u8; 4]);
+/// [`Bm1366ChainBringUp`] to replay a captured domain config table
+/// verbatim -- see `board/antminer_s19k_am3.rs` for where these
+/// values come from.
+pub type DomainConfigWrite = (u8, RegisterAddress, [u8; 4]);
 
 /// Reconfigures a chip UART's baud rate on the host side, after the
 /// chip side is told to switch via a `UartBaud` register write.
 ///
 /// Deliberately transport-agnostic (this module has no dependency on
 /// `crate::transport`) -- boards that need a real baud switch during
-/// bring-up (see [`ChipInitStrategy::Bm1366Chain`]) implement this
-/// against whatever concrete serial transport they use.
+/// bring-up (see [`Bm1366ChainBringUp`]) implement this against
+/// whatever concrete serial transport they use.
 pub trait BaudControl: Send + Sync {
     fn set_baud_rate(&self, baud: u32) -> Result<()>;
 }
 
-/// How to bring a BM13xx chip or chain up on first work assignment.
+/// Board-specific override of the shared, config-driven bring-up in
+/// `Actor::initialize_chain`, for a chain whose real captured wire
+/// behavior doesn't fit `ChipConfig`/`TopologySpec` yet.
 ///
-/// Different chip families and board topologies need genuinely
-/// different register sequences, not just different tuning constants
-/// plugged into one generic algorithm -- see `initialize_chip`'s
-/// dispatch below for why this isn't a single parameterized function.
-pub enum ChipInitStrategy {
-    /// A single BM1370 chip at address 0 (Bitaxe Gamma) -- the
-    /// original tuned sequence this module shipped with.
-    Bm1370Single,
-
-    /// A chain of `chip_count` BM1366 chips sharing one UART
-    /// (Antminer S19K Pro AM3-style boards). Addresses every chip via
-    /// a `SetChipAddress` sweep before configuring, then replays
-    /// `domain_config` verbatim (semantics not fully understood yet --
-    /// see the engineering log
-    /// (`docs/s19k-pro/reference/full-engineering-log.md`), Round 5/6
-    /// -- so captured real bytes are used rather than a guessed-at
-    /// general rule).
-    Bm1366Chain {
-        chip_count: u8,
-        domain_config: &'static [DomainConfigWrite],
-        /// If present, switches both the chip side (`UartBaud`
-        /// register write) and the host tty to `bosminer`'s real
-        /// confirmed 3,125,000 operating baud after the rest of
-        /// bring-up completes. Round 8 tested this switch on real
-        /// hardware: by itself it changed nothing, though the
-        /// investigation around it found and removed a real corruption
-        /// source. `None` stays at the discovery-time 115200 baud
-        /// throughout.
-        baud_control: Option<Box<dyn BaudControl>>,
-    },
+/// Currently exists for exactly one board: the Antminer S19K Pro's
+/// BM1366 chain. See `initialize_chip_bm1366_chain`'s doc comment for
+/// why this chain's real captured sequence (register values,
+/// ordering, a mid-bring-up baud switch) diverges from the shared
+/// path rather than being expressed as new `ChipConfig` fields --
+/// several of those values (e.g. ClockDelay, the per-chip MiscControl
+/// value) genuinely differ from what the shared path currently sends
+/// for every other chip model, and this chain's bring-up is still an
+/// open investigation (see the doc comment below), not settled
+/// behavior to generalize from yet.
+pub struct Bm1366ChainBringUp {
+    pub chip_count: u8,
+    pub domain_config: &'static [DomainConfigWrite],
+    /// If present, switches both the chip side (`UartBaud` register
+    /// write) and the host tty to `bosminer`'s real confirmed
+    /// 3,125,000 operating baud after the rest of bring-up completes.
+    /// `None` stays at the discovery-time 115200 baud throughout.
+    pub baud_control: Option<Box<dyn BaudControl>>,
 }
 
 #[async_trait]
@@ -296,693 +241,810 @@ impl HashThread for BM13xxThread {
     }
 }
 
-/// Dispatch chip/chain bring-up to the strategy-appropriate
-/// implementation.
-///
-/// Kept as a thin dispatcher rather than one parameterized function:
-/// the two strategies differ in more than tuning constants (single
-/// chip at a fixed address vs. an N-chip daisy-chain sweep, entirely
-/// different captured register sequences), so sharing one function
-/// body would mean threading chip-count/addressing-mode conditionals
-/// through nearly every line rather than two clearly-scoped
-/// implementations.
-async fn initialize_chip<W>(
-    strategy: &ChipInitStrategy,
-    chip_commands: &mut W,
-    peripherals: &mut BoardPeripherals,
-    asic_difficulty: Log2Difficulty,
-) -> Result<()>
-where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
-{
-    match strategy {
-        ChipInitStrategy::Bm1370Single => {
-            initialize_chip_bm1370_single(chip_commands, peripherals, asic_difficulty).await
-        }
-        ChipInitStrategy::Bm1366Chain {
-            chip_count,
-            domain_config,
-            baud_control,
-        } => {
-            initialize_chip_bm1366_chain(
-                *chip_count,
-                domain_config,
-                baud_control.as_deref(),
-                chip_commands,
-                peripherals,
-                asic_difficulty,
-            )
-            .await
-        }
-    }
+/// Command messages sent from scheduler to thread
+#[derive(Debug)]
+enum ThreadCommand {
+    /// Declare expected hashrate and ready the thread for work
+    Configure,
+
+    /// Update task (old shares still valid)
+    UpdateTask {
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+    },
+
+    /// Replace task (old shares invalid)
+    ReplaceTask {
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+    },
+
+    /// Go idle (stop hashing, low power)
+    GoIdle {
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+    },
 }
 
-/// Initialize a single BM1370 chip for mining (Bitaxe Gamma).
+/// Internal actor for BM13xxThread.
 ///
-/// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip_bm1370_single<W>(
-    chip_commands: &mut W,
-    peripherals: &mut BoardPeripherals,
+/// The channels the select loop awaits are `run` parameters rather
+/// than fields, so the loop can borrow them independently of the
+/// actor state.
+struct Actor<W> {
+    /// Chip model configuration (identity, PLL parameters).
+    config: ChipConfig,
+
+    /// Live model of the chip chain, built from the board's declared
+    /// topology.
+    chain: Chain,
+
+    /// Event channel to the scheduler.
+    event_tx: mpsc::Sender<HashThreadEvent>,
+
+    /// Shared status, read by the handle.
+    status: Arc<RwLock<HashThreadStatus>>,
+
+    /// Sink for sending encoded commands to chips.
+    chip_commands: W,
+
+    /// Hardware interfaces from the board (reset line, regulator, etc.).
+    peripherals: BoardPeripherals,
+
+    /// Owner of the response demux task. Held only so the task is
+    /// aborted, releasing the serial stream, when the actor exits.
+    _reader: Reader,
+
+    /// ASIC ticket mask difficulty.
     asic_difficulty: Log2Difficulty,
-) -> Result<()>
-where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
-{
-    use protocol::{Command, Register};
 
-    // Enable the ASIC
-    if let Some(ref mut asic_enable) = peripherals.asic_enable {
-        debug!("Enabling ASIC");
-        asic_enable
-            .enable()
-            .await
-            .context("failed to enable ASIC")?;
-    }
+    /// Whether lazy chain initialization has run.
+    chain_initialized: bool,
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    /// Board-supplied override of the shared bring-up in
+    /// `initialize_chain`, for chains whose real captured wire
+    /// behavior doesn't fit `ChipConfig`/`TopologySpec` yet. See
+    /// [`Bm1366ChainBringUp`].
+    bring_up_override: Option<Bm1366ChainBringUp>,
 
-    // Send a register write command, converting the sink error to anyhow.
-    async fn send_reg<W>(chip_commands: &mut W, broadcast: bool, register: Register) -> Result<()>
-    where
-        W: Sink<protocol::Command> + Unpin,
-        W::Error: std::fmt::Debug,
-    {
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast,
-                chip_address: 0x00,
-                register,
-            })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-    }
+    /// The task currently being hashed.
+    current_task: Option<HashTask>,
 
-    // Send version mask configuration (3 times)
-    debug!("Configuring version mask");
-    for _ in 1..=3 {
-        send_reg(
-            chip_commands,
-            true,
-            Register::VersionMask(protocol::VersionMask::full_rolling()),
-        )
-        .await
-        .context("failed to send version mask")?;
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    // Pre-configuration registers
-    debug!("Sending pre-configuration registers");
-
-    send_reg(
-        chip_commands,
-        true,
-        Register::InitControl {
-            raw_value: 0x00000700,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscControl {
-            raw_value: 0x00C100F0,
-        },
-    )
-    .await?;
-
-    chip_commands
-        .send(Command::ChainInactive)
-        .await
-        .map_err(|e| anyhow!("{e:?}"))
-        .context("failed to send ChainInactive")?;
-
-    chip_commands
-        .send(Command::SetChipAddress { chip_address: 0x00 })
-        .await
-        .map_err(|e| anyhow!("{e:?}"))
-        .context("failed to send SetChipAddress")?;
-
-    // Core configuration (broadcast)
-    debug!("Sending broadcast core configuration");
-
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_8B00,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_800C,
-        },
-    )
-    .await?;
-
-    // Ticket mask
-    let ticket_mask = TicketMask::new(asic_difficulty);
-
-    send_reg(chip_commands, true, Register::TicketMask(ticket_mask)).await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::IoDriverStrength(protocol::IoDriverStrength::normal()),
-    )
-    .await?;
-
-    // Chip-specific configuration
-    debug!("Sending chip-specific configuration");
-
-    send_reg(
-        chip_commands,
-        false,
-        Register::InitControl {
-            raw_value: 0xF0010700,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::MiscControl {
-            raw_value: 0x00C100F0,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_8B00,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_800C,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_82AA,
-        },
-    )
-    .await?;
-
-    // Additional settings
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscSettings {
-            raw_value: 0x80440000,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::AnalogMux {
-            raw_value: 0x02000000,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscSettings {
-            raw_value: 0x80440000,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_8DEE,
-        },
-    )
-    .await?;
-
-    // Frequency ramping (56.25 MHz -> 525 MHz)
-    debug!("Ramping frequency from 56.25 MHz to 525 MHz");
-    let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
-
-    for (i, pll_config) in frequency_steps.iter().enumerate() {
-        send_reg(chip_commands, true, Register::PllDivider(*pll_config))
-            .await
-            .context("PLL ramp failed")?;
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        if i % 10 == 0 || i == frequency_steps.len() - 1 {
-            trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
-        }
-    }
-
-    debug!("Frequency ramping complete");
-
-    // Final configuration
-    send_reg(
-        chip_commands,
-        true,
-        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::VersionMask(protocol::VersionMask::full_rolling()),
-    )
-    .await?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    Ok(())
+    /// Tasks sent to the chip, by chip job id.
+    chip_jobs: ChipJobTracker,
 }
 
-/// Initialize a chain of `chip_count` BM1366 chips (Antminer S19K Pro
-/// AM3-style boards) for mining.
-///
-/// The sequence is real, captured wire data (via a ptrace syscall
-/// tracer against `bosminer`'s own successful bring-up -- see
-/// `docs/s19k-pro/reference/full-engineering-log.md`'s Round 4/5/6),
-/// not a guessed-at adaptation of the BM1370 sequence above --
-/// BM1366's actual required order and register values differ
-/// genuinely, not just in tuning constants (`initialize_chip`'s doc
-/// comment has the full rationale for why this is a separate function
-/// rather than a shared parameterized one).
-///
-/// **This sequence has mined, but does not out of the box today.**
-/// Real `Nonce` responses decoded and the pool accepted real shares in
-/// Round 12, and Round 14 confirmed ~4-6 TH/s at ~300 MHz. A fresh
-/// build run on real hardware on 2026-08-27 completed the whole
-/// sequence below --- all 231 chips addressed, per-chip pass sent,
-/// baud switched, chains enabled, the ramp below run to its 575 MHz
-/// target, pool connected --- and then produced **zero nonces in five
-/// minutes, with board temperature flat at ambient**.
-///
-/// That is the retest the notes had been calling for, and it came back
-/// negative: the `Core` byte-order fix is present in this crate and is
-/// **not on its own sufficient** to make this driver hash at 575 MHz.
-/// The signature is the one Round 14 recorded for every frequency above
-/// 300 MHz. Whatever else the reference port does differently has not
-/// been identified yet.
-///
-/// What is *not* established for this driver is frequency headroom.
-/// Every frequency above ~300 MHz failed identically here -- flat
-/// temperature, zero nonces -- and Round 15 found why: a byte-order bug
-/// on the `Core` register left `CORE_MAILBOX`'s "apply to all cores"
-/// bit clear, so core-enable never applied chain-wide. That fix is in
-/// this crate (see `protocol.rs`'s `encode_data` and the broadcast
-/// writes below), but the ~105 TH/s at 575 MHz that proved it was
-/// measured against the *reference* port, not this driver, which has
-/// not been retested above 300 MHz since. Any shortfall now is a
-/// driver bug, not a hardware limit.
-///
-/// Specifics worth knowing before changing any of this:
-/// - Switches to `bosminer`'s real 3,125,000 operating baud when the
-///   caller supplies a [`BaudControl`], which the S19K Pro board driver
-///   does. Round 8 tested the switch on real hardware: it changed
-///   nothing by itself, but the investigation found and removed a real
-///   corruption source. Uses the exact captured `UartBaud` wire value
-///   (`0x00003011`), not this module's `BaudRate::Baud3M`/`Baud1M`
-///   constants, which were captured from a different chip/board and do
-///   not match. With no `BaudControl`, stays at the discovery-time
-///   115200 baud throughout.
-/// - Sends the per-chip addressed `InitControl`/`MiscControl`/`Core`
-///   pass with the real captured values, which genuinely differ from
-///   the broadcast ones (`00 07 01 f0` / `f0 00 c1 00`, and the `Core`
-///   triplet in its captured order). Round 10 sent this pass with
-///   guessed values and stayed silent; Round 12 extracted the real ones
-///   from the existing trace and mined the first accepted share.
-/// - `NonceRange` is the real BM1366 value (`0x5a10_0000`). **Do not
-///   "fix" this by calling `multi_chip()`:** for 77 chips that selects
-///   the S21 Pro value and discards the captured BM1366 one. Real
-///   firmware broadcasts a single value and still reaches full
-///   hashrate.
-async fn initialize_chip_bm1366_chain<W>(
-    chip_count: u8,
-    domain_config: &[DomainConfigWrite],
-    baud_control: Option<&dyn BaudControl>,
-    chip_commands: &mut W,
-    peripherals: &mut BoardPeripherals,
-    asic_difficulty: Log2Difficulty,
-) -> Result<()>
+impl<W> Actor<W>
 where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
+    W: ChipCommandSink + Unpin,
+    SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
-    use protocol::{Command, Register, RegisterAddress};
-
-    if let Some(ref mut asic_enable) = peripherals.asic_enable {
-        debug!("Enabling ASIC chain");
-        asic_enable
-            .enable()
-            .await
-            .context("failed to enable ASIC chain")?;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    async fn send_broadcast<W>(chip_commands: &mut W, register: Register) -> Result<()>
-    where
-        W: Sink<protocol::Command> + Unpin,
-        W::Error: std::fmt::Debug,
-    {
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register,
-            })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-    }
-
-    debug!("Configuring version mask");
-    for _ in 0..3 {
-        send_broadcast(
-            chip_commands,
-            Register::VersionMask(protocol::VersionMask::full_rolling()),
-        )
-        .await
-        .context("failed to send VersionMask")?;
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-    }
-
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x00, 0x00]),
-    )
-    .await
-    .context("failed to send InitControl")?;
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::MiscControl, &[0xff, 0x0f, 0xc1, 0x00]),
-    )
-    .await
-    .context("failed to send MiscControl")?;
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-
-    debug!("Sending ChainInactive");
-    for _ in 0..3 {
-        chip_commands
-            .send(Command::ChainInactive)
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-            .context("failed to send ChainInactive")?;
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-    }
-
-    debug!(chip_count, "Sweeping SetChipAddress");
-    for i in 0..chip_count as u16 {
-        let chip_address = (i * 2) as u8;
-        chip_commands
-            .send(Command::SetChipAddress { chip_address })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-            .context("failed to send SetChipAddress")?;
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-
-    // Round 9 found *why* Core corrupted communication (Rounds 7/8):
-    // Register::decode always used little-endian, but Core's wire
-    // encoding is big-endian (see protocol.rs's decode fix) -- so
-    // every Core write sent so far was a malformed CORE_MAILBOX
-    // command (see REFERENCE.md's "0x3C - CORE_MAILBOX"), not the
-    // real captured one. Decoding the real captured bytes
-    // big-endian instead matches REFERENCE.md's documented bring-up
-    // values exactly (reg 0x05=0x40 "clock select", reg 0x00=0x20
-    // "clock delay" for BM1366). Restored now that decode is fixed.
-    debug!("Sending broadcast core configuration (CORE_MAILBOX, now correctly big-endian)");
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x85, 0x40]),
-    )
-    .await?;
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::Core, &[0x80, 0x00, 0x80, 0x20]),
-    )
-    .await?;
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::AnalogMux, &[0x00, 0x00, 0x00, 0x03]),
-    )
-    .await?;
-    send_broadcast(
-        chip_commands,
-        Register::decode(RegisterAddress::IoDriverStrength, &[0x02, 0x11, 0x41, 0x11]),
-    )
-    .await?;
-
-    // REFERENCE.md's documented bring-up (BM1370 walkthrough) has a
-    // full "per-chip pass" step: SOFT_RESET_CONTROL (InitControl) and
-    // MISC_CONTROL, both already sent broadcast above, get *repeated
-    // addressed to each chip individually*, immediately before the
-    // CORE_MAILBOX per-chip pass. Round 10 sent this addressed but
-    // reused the broadcast-phase data verbatim, since this board's
-    // real per-chip values were unknown/uncaptured at the time --
-    // that round shipped and tested clean, but still produced zero
-    // Nonce responses.
-    //
-    // Round 12 went back to the original bosminer wire capture
-    // (/tmp/trace.log on the miner, captured in Round 4 via
-    // s19k-trace) and searched it specifically for *addressed*
-    // (non-broadcast) InitControl/MiscControl/Core writes -- a query
-    // never run before, because every earlier pass through that trace
-    // only pulled out the broadcast-phase values. It turns out the
-    // real per-chip values genuinely differ from the broadcast ones
-    // (matching REFERENCE.md's description of the per-chip pass
-    // adding extra "bring-up" bits on top of the broadcast values),
-    // and the real Core triplet order is different from what Round 10
-    // guessed. Confirmed identical across all 77 chip addresses
-    // (0x00..=0x98) on ttyS1 -- these are fixed values applied to
-    // every chip, not per-address-varying data:
-    //   InitControl addressed: 00 07 01 f0  (broadcast was 00 07 00 00)
-    //   MiscControl  addressed: f0 00 c1 00  (broadcast was ff 0f c1 00)
-    //   Core triplet, in this exact real order:
-    //     1. 80 00 80 20  (reg 0x00 clock delay = 0x20)
-    //     2. 80 00 82 aa  (reg 0x02 core enable  = 0xAA)
-    //     3. 80 00 85 40  (reg 0x05 clock select = 0x40)
-    debug!(
-        chip_count,
-        "Sending per-chip InitControl/MiscControl/CORE_MAILBOX pass"
-    );
-    for i in 0..chip_count as u16 {
-        let chip_address = (i * 2) as u8;
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast: false,
-                chip_address,
-                register: Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x01, 0xf0]),
-            })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-            .context("failed to send per-chip InitControl")?;
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast: false,
-                chip_address,
-                register: Register::decode(RegisterAddress::MiscControl, &[0xf0, 0x00, 0xc1, 0x00]),
-            })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-            .context("failed to send per-chip MiscControl")?;
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        for data in [
-            [0x80u8, 0x00, 0x80, 0x20], // reg 0x00 clock delay = 0x20
-            [0x80, 0x00, 0x82, 0xaa],   // reg 0x02 core enable = 0xAA
-            [0x80, 0x00, 0x85, 0x40],   // reg 0x05 clock select = 0x40
-        ] {
-            chip_commands
-                .send(Command::WriteRegister {
-                    broadcast: false,
-                    chip_address,
-                    register: Register::decode(RegisterAddress::Core, &data),
-                })
-                .await
-                .map_err(|e| anyhow!("{e:?}"))
-                .context("failed to send per-chip CORE_MAILBOX write")?;
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    }
-
-    debug!(
-        writes = domain_config.len(),
-        "Sending per-chip domain config writes"
-    );
-    for &(chip_address, register_address, data) in domain_config {
-        let register = Register::decode(register_address, &data);
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast: false,
-                chip_address,
-                register,
-            })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
-            .context("failed to send domain config write")?;
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-
-    // Rounds 12-14 (see the engineering log) tried five real
-    // hypotheses for why
-    // nothing above ~300MHz produced real hashing (flat temperature,
-    // zero nonces despite clean communication) -- fb_div range, ramp
-    // granularity, VCO stability mid-ramp, settle time, post-divider
-    // preservation -- all ruled out. A real, independently-developed
-    // reference (github.com/Schnitzel/mujina, amlogic-s19kpro-support
-    // branch, with its own real hardware testing on this exact
-    // BHB56902/S19K Pro hashboard) found two real bugs and one real
-    // structural difference:
-    //
-    // 1. BM1366 requires strict `post_div1 > post_div2`, not `>=`.
-    //    Sourced from bitaxeorg/ESP-Miner's real firmware
-    //    (`components/asic/bm1366.c`'s `pll_get_parameters`), not a
-    //    guess -- see `calculate_pll_bm1366` below, which fixes it.
-    //    Every Round 14 hypothesis used `>=`, which allows
-    //    `post_div1 == post_div2` (e.g. 6x6=36) -- an electrically
-    //    invalid combination for this chip family that BM1362/BM1370
-    //    tolerate but BM1366 doesn't.
-    // 2. This exact hashboard's real factory operating voltage is
-    //    13.9V (Braiins' own bosminer log: `Detected hashboard #2:
-    //    Voltage (Avg.) 13.90 V, Frequency (Avg.) 645 MHz`) -- see
-    //    `PSU_TARGET_VOLTS` in `board/antminer_s19k_am3.rs`. Every
-    //    Round 14 test ran at the 15.2V bring-up ceiling instead.
-    // 3. **The frequency ramp runs last**, after TicketMask/NonceRange
-    //    and the baud switch, not before them. Every Round 12-14
-    //    sequence (including this function's own history) ramped
-    //    frequency *then* configured TicketMask/NonceRange -- cores
-    //    would already be enabled and computing at the ramped
-    //    frequency before the registers that control what they report
-    //    (and how) were ever set to their real values.
-    //
-    // TicketMask, NonceRange, and the baud switch now run immediately
-    // after the per-chip pass and domain config, before frequency
-    // ramping -- matching the reference's real, working order.
-    let ticket_mask = TicketMask::new(asic_difficulty);
-    send_broadcast(chip_commands, Register::TicketMask(ticket_mask))
-        .await
-        .context("failed to send TicketMask")?;
-
-    // Real BM1366 value, sourced from the reference's
-    // `chip_config.rs` (`nonce_range: 0x5a10_0000`), not the reused
-    // BM1370 placeholder (`0xB51E0000`) this function used through
-    // Round 14 -- that value got chips searching *something*, but
-    // never a BM1366-real range.
-    send_broadcast(
-        chip_commands,
-        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0x5a10_0000)),
-    )
-    .await
-    .context("failed to send NonceRange")?;
-
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    // Switch to bosminer's real confirmed operating baud (3,125,000),
-    // if the board supports it. Two things have to happen in order:
-    // tell the chips via the real captured UartBaud value first
-    // (0x00003011 -- NOT this module's BaudRate::Baud3M/Baud1M
-    // constants, which were captured from a different chip/board and
-    // don't match this board's real wire bytes), *then* reconfigure
-    // the host tty to match -- reversing the order would leave the
-    // host talking at the old rate to chips already listening at the
-    // new one.
-    if let Some(baud_control) = baud_control {
-        const REAL_UART_BAUD_REGISTER_VALUE: u32 = 0x0000_3011;
-        const REAL_OPERATING_BAUD: u32 = 3_125_000;
-
-        debug!(
-            baud = REAL_OPERATING_BAUD,
-            "Switching to real operating baud"
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        config: ChipConfig,
+        topology: TopologySpec,
+        event_tx: mpsc::Sender<HashThreadEvent>,
+        status: Arc<RwLock<HashThreadStatus>>,
+        chip_commands: W,
+        peripherals: BoardPeripherals,
+        reader: Reader,
+        bring_up_override: Option<Bm1366ChainBringUp>,
+    ) -> Self {
+        // ASIC ticket mask difficulty: ~1 nonce/sec at nameplate rate
+        let asic_difficulty = Log2Difficulty::from_difficulty(
+            ShareRate::per_second(1.0).to_difficulty(config.nameplate),
         );
-        send_broadcast(
+
+        Self {
+            config,
+            chain: Chain::from_topology(&topology),
+            event_tx,
+            status,
             chip_commands,
-            Register::UartBaud(protocol::BaudRate::Custom(REAL_UART_BAUD_REGISTER_VALUE)),
-        )
-        .await
-        .context("failed to send UartBaud")?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        baud_control
-            .set_baud_rate(REAL_OPERATING_BAUD)
-            .context("failed to switch host tty to real operating baud")?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    // Frequency ramp -- deliberately last. Targets 575MHz: the
-    // reference's own real hardware measurement on this exact chip
-    // family (39.68 TH/s on mujina itself, LuxOS gets 39.15-39.33
-    // TH/s at the same point) -- deliberately not the 645MHz factory
-    // ceiling, which their notes call "right at the edge of
-    // stability" (645MHz measured *less* hashrate than 575MHz).
-    const TARGET_MHZ: f32 = 575.0;
-    const RAMP_STEP_MHZ: f32 = 6.25;
-    const RAMP_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-
-    debug!(
-        target_mhz = TARGET_MHZ,
-        step_mhz = RAMP_STEP_MHZ,
-        "Ramping frequency"
-    );
-    let mut mhz = 56.25f32;
-    loop {
-        mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
-            mhz + RAMP_STEP_MHZ
-        } else {
-            TARGET_MHZ
-        };
-        let pll = calculate_pll_bm1366(mhz)
-            .with_context(|| format!("no valid BM1366 PLL config for {mhz}MHz"))?;
-        send_broadcast(chip_commands, Register::PllDivider(pll))
-            .await
-            .with_context(|| format!("failed to send PllDivider for {mhz}MHz ramp step"))?;
-        tokio::time::sleep(RAMP_STEP_DELAY).await;
-        if mhz >= TARGET_MHZ {
-            break;
+            peripherals,
+            _reader: reader,
+            asic_difficulty,
+            chain_initialized: false,
+            bring_up_override,
+            current_task: None,
+            chip_jobs: ChipJobTracker::new(),
         }
     }
-    debug!(mhz, "Frequency ramp complete");
 
-    Ok(())
+    /// Runs the actor loop until shutdown or channel closure.
+    ///
+    /// Handles commands from the scheduler (update/replace work, go
+    /// idle), the shutdown signal from the board (USB unplug,
+    /// fault, etc.), and the demuxed chip responses from the reader.
+    /// Reset is asserted on startup to establish known state; the
+    /// chain is initialized lazily when the scheduler assigns first
+    /// work.
+    async fn run(
+        mut self,
+        mut command_rx: mpsc::Receiver<ThreadCommand>,
+        mut shutdown_rx: watch::Receiver<()>,
+        channels: ReaderChannels,
+    ) {
+        let ReaderChannels {
+            mut nonces,
+            mut register_responses,
+        } = channels;
+
+        // Assert reset on startup to establish known state
+        if let Err(e) = self.peripherals.reset_line.assert().await {
+            warn!(error = %e, "Failed to assert chip reset on startup");
+        }
+
+        let mut ntime_ticker = time::interval(Duration::from_secs(1));
+        ntime_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                // Shutdown signal (highest priority); an error means
+                // the board dropped the sender, which requests
+                // shutdown too
+                _ = shutdown_rx.changed() => {
+                    self.set_active(false);
+
+                    // Exit actor loop (channel closure signals exit to the scheduler)
+                    break;
+                }
+
+                // Commands from scheduler
+                cmd = command_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        debug!("Thread handle dropped");
+                        break;
+                    };
+                    match cmd {
+                        ThreadCommand::Configure => self.configure().await,
+
+                        ThreadCommand::UpdateTask { new_task, response_tx } => {
+                            let flow = self
+                                .assign_task(new_task, response_tx, false, &mut shutdown_rx, &mut register_responses)
+                                .await;
+                            if flow.is_break() {
+                                break;
+                            }
+                        }
+
+                        ThreadCommand::ReplaceTask { new_task, response_tx } => {
+                            let flow = self
+                                .assign_task(new_task, response_tx, true, &mut shutdown_rx, &mut register_responses)
+                                .await;
+                            if flow.is_break() {
+                                break;
+                            }
+                        }
+
+                        ThreadCommand::GoIdle { response_tx } => {
+                            debug!("Going idle");
+
+                            let old_task = self.current_task.take();
+                            self.set_active(false);
+                            response_tx.send(Ok(old_task)).ok();
+                        }
+                    }
+                }
+
+                // Nonce reports from the chips
+                nonce = nonces.recv() => {
+                    let Some(nonce) = nonce else {
+                        warn!("Chip response stream ended");
+                        break;
+                    };
+                    self.handle_nonce(nonce).await;
+                }
+
+                // Replies to register conversations; nothing asks
+                // yet, so log and discard
+                response = register_responses.recv() => {
+                    let Some(response) = response else {
+                        warn!("Chip response stream ended");
+                        break;
+                    };
+                    trace!(
+                        chip_address = %format!("0x{:02x}", response.chip_address),
+                        register = ?response.register,
+                        "Register read response"
+                    );
+                }
+
+                // ntime rolling timer (roll forward every second)
+                _ = ntime_ticker.tick(), if self.current_task.is_some() => {
+                    self.roll_ntime().await;
+                }
+            }
+        }
+
+        self.disable_chain().await;
+        debug!("BM13xx thread actor exiting");
+    }
+
+    /// Asserts the chips' reset, then disables the core rail.
+    /// Idempotent, and safe before bring-up. On an unplugged
+    /// board both writes fail; the warnings are all that can be
+    /// done.
+    async fn disable_chain(&mut self) {
+        if let Err(e) = self.peripherals.reset_line.assert().await {
+            warn!(error = %e, "Failed to assert chip reset on exit");
+        }
+        if let Err(e) = self.peripherals.voltage_regulator.disable().await {
+            warn!(error = %e, "Failed to disable core voltage on exit");
+        }
+    }
+
+    /// Declares the thread's expected hashrate to the scheduler.
+    async fn configure(&mut self) {
+        // Nameplate rate for one chip; a rough stand-in for a real
+        // frequency-derived estimate.
+        let expected = self.config.nameplate;
+        if self
+            .event_tx
+            .send(HashThreadEvent::ExpectedHashRate(expected))
+            .await
+            .is_err()
+        {
+            debug!("Event channel closed during configure");
+        }
+    }
+
+    /// Takes a new task and sends its first job to the chip,
+    /// initializing the chain on the first assignment. `replace`
+    /// forgets prior jobs, invalidating their shares. Returns
+    /// `Break` when the actor must exit because the board's
+    /// shutdown signal cut bring-up short.
+    async fn assign_task(
+        &mut self,
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
+        replace: bool,
+        shutdown_rx: &mut watch::Receiver<()>,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> ControlFlow<()> {
+        let verb = if replace { "Replacing" } else { "Updating" };
+        if let Some(ref old) = self.current_task {
+            debug!(
+                old_job = %old.template.id,
+                new_job = %new_task.template.id,
+                "{verb} work"
+            );
+        } else {
+            debug!(new_job = %new_task.template.id, "{verb} work from idle");
+        }
+
+        // The select watches for shutdown while bring-up runs, so
+        // every await point in bring-up is an abort point.
+        // Dropping the half-done future is safe because the actor
+        // disables the chain on exit whatever the bring-up
+        // progress.
+        tokio::select! {
+            result = self.ensure_chain_initialized(register_responses) => {
+                if let Err(e) = result {
+                    error!(error = %e, "Chain initialization failed");
+                    response_tx.send(Err(e)).ok();
+                    return ControlFlow::Continue(());
+                }
+            }
+
+            _ = shutdown_rx.changed() => {
+                debug!("Shutdown requested during bring-up");
+                response_tx.send(Err(anyhow!("shut down during bring-up"))).ok();
+                return ControlFlow::Break(());
+            }
+        }
+
+        if replace {
+            // Clear old jobs (old shares invalid)
+            self.chip_jobs.clear();
+        }
+
+        // Send the task's first job; the ntime roller sends the rest
+        let chip_job_id = self.chip_jobs.insert(new_task.clone());
+        let old_task = self.current_task.replace(new_task.clone());
+        match task_to_job_full(&new_task, chip_job_id) {
+            Ok(job_data) => {
+                if let Err(e) = self.chip_commands.send(JobCommand::JobFull(job_data)).await {
+                    error!(error = ?e, "Failed to send first JobFull to chip");
+                    let err = anyhow!("failed to send job to chip: {e:?}");
+                    response_tx.send(Err(err)).ok();
+                    return ControlFlow::Continue(());
+                } else if replace {
+                    debug!("Sent first job to chip (old work invalidated)");
+                } else {
+                    debug!("Sent first job to chip");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to convert task to JobFull");
+                response_tx.send(Err(e)).ok();
+                return ControlFlow::Continue(());
+            }
+        }
+
+        self.set_active(true);
+        response_tx.send(Ok(old_task)).ok();
+        ControlFlow::Continue(())
+    }
+
+    /// Initializes the chain on the first call; later calls are
+    /// no-ops.
+    async fn ensure_chain_initialized(
+        &mut self,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> Result<()> {
+        if self.chain_initialized {
+            return Ok(());
+        }
+
+        trace!("Initializing chain on first assignment.");
+        match &self.bring_up_override {
+            Some(bring_up) => {
+                initialize_chip_bm1366_chain(
+                    bring_up.chip_count,
+                    bring_up.domain_config,
+                    bring_up.baud_control.as_deref(),
+                    &mut self.chip_commands,
+                    &mut self.peripherals,
+                    self.asic_difficulty,
+                )
+                .await?;
+            }
+            None => {
+                self.initialize_chain(register_responses).await?;
+            }
+        }
+        self.chain_initialized = true;
+        Ok(())
+    }
+
+    /// Initializes the chip chain for mining.
+    ///
+    /// Powers the core rail, releases the chips from reset,
+    /// enumerates them against the declared topology, assigns
+    /// addresses, configures all registers, and ramps the frequency
+    /// to target.
+    async fn initialize_chain(
+        &mut self,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> Result<()> {
+        // Power the core rail before releasing reset
+        debug!("Enabling core voltage");
+        self.peripherals
+            .voltage_regulator
+            .enable()
+            .await
+            .context("failed to enable core voltage")?;
+        time::sleep(Duration::from_millis(500)).await;
+
+        // Release the chips from reset
+        debug!("Releasing chip reset");
+        self.peripherals
+            .reset_line
+            .release()
+            .await
+            .context("failed to release chip reset")?;
+
+        time::sleep(Duration::from_millis(200)).await;
+
+        // Send version mask configuration (3 times)
+        debug!("Configuring version mask");
+        for _ in 1..=3 {
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination: Destination::Broadcast,
+                    register: Register::MidstateConfig(MidstateConfig::full_rolling()),
+                }))
+                .await
+                .context("failed to send version mask")?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        time::sleep(Duration::from_millis(10)).await;
+
+        // Enumerate the chips and check them against the declared
+        // topology. The version mask above switched the chips to the
+        // 11-byte response format the codec parses.
+        debug!("Enumerating chips");
+        let replies = RegisterClient::new(&mut self.chip_commands, register_responses)
+            .broadcast_read(RegisterAddress::ChipId)
+            .await
+            .context("chip enumeration failed")?;
+        if replies.len() != self.chain.chip_count() {
+            bail!(
+                "found {} chips, declared topology has {}",
+                replies.len(),
+                self.chain.chip_count()
+            );
+        }
+        debug!(chips = replies.len(), "Chip enumeration complete");
+
+        // Pre-configuration registers
+        debug!("Sending pre-configuration registers");
+
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::SoftResetControl(self.config.soft_reset_defaults),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::MiscControl(self.config.misc_control),
+            }))
+            .await?;
+
+        self.chip_commands
+            .send(RegisterCommand::ChainInactive(ChainInactive))
+            .await
+            .context("failed to send ChainInactive")?;
+
+        // Address the chips in chain order. After ChainInactive, the
+        // first unaddressed chip adopts each SetChipAddress and
+        // forwards later ones downstream, so one command per chip
+        // addresses the whole chain.
+        self.chain
+            .assign_addresses()
+            .context("chip address assignment failed")?;
+        for (_, chip) in self.chain.chips() {
+            self.chip_commands
+                .send(RegisterCommand::SetChipAddress(SetChipAddress {
+                    chip_address: chip.address,
+                }))
+                .await
+                .context("failed to send SetChipAddress")?;
+        }
+
+        // Core configuration (broadcast)
+        debug!("Sending broadcast core configuration");
+
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(self.config.clock_select),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(CoreCommand::write_all(
+                    CoreRegister::ClockDelay,
+                    0x0C,
+                )),
+            }))
+            .await?;
+
+        // Ticket mask
+        let ticket_mask = TicketMask::new(self.asic_difficulty);
+
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::TicketMask(ticket_mask),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::IoDriverStrength(IoDriverStrength::normal()),
+            }))
+            .await?;
+
+        // Chip-specific configuration
+        debug!("Sending chip-specific configuration");
+
+        for (_, chip) in self.chain.chips() {
+            let destination = Destination::Chip(chip.address);
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::SoftResetControl(self.config.core_reset),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::MiscControl(self.config.misc_control),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(self.config.clock_select),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::write_all(
+                        CoreRegister::ClockDelay,
+                        0x0C,
+                    )),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::write_all(
+                        CoreRegister::CoreEnable,
+                        0xAA,
+                    )),
+                }))
+                .await?;
+        }
+
+        // Additional settings
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AdcCtrl1(AdcCtrl1::bring_up()),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AnalogMux(self.config.analog_mux),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AdcCtrl1(AdcCtrl1::bring_up()),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(CoreCommand::nonce_bin_overflow(true)),
+            }))
+            .await?;
+
+        // Frequency ramping from the reset frequency to the
+        // configured target
+        let ramp = *self.config.freq_range.start()..=self.config.default_freq;
+        debug!(
+            "Ramping frequency from {} MHz to {} MHz",
+            ramp.start().mhz(),
+            ramp.end().mhz()
+        );
+        let frequency_steps =
+            generate_frequency_ramp_steps(&self.config, ramp, self.config.ramp_step);
+
+        for (i, pll_config) in frequency_steps.iter().enumerate() {
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination: Destination::Broadcast,
+                    register: Register::PllDivider(*pll_config),
+                }))
+                .await
+                .context("PLL ramp failed")?;
+
+            time::sleep(Duration::from_millis(100)).await;
+
+            if i % 10 == 0 || i == frequency_steps.len() - 1 {
+                trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
+            }
+        }
+
+        debug!("Frequency ramping complete");
+
+        // Final configuration
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::HashCountingNumber(self.config.hash_counting_number),
+            }))
+            .await?;
+        self.chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
+            }))
+            .await?;
+
+        time::sleep(Duration::from_millis(150)).await;
+
+        // Verify bring-up by reading configuration back from every
+        // chip at its assigned address; a directed read answered at
+        // that address also proves the chip took it.
+        debug!("Verifying chain configuration");
+        let target_pll = self
+            .config
+            .calculate_pll(self.config.default_freq)
+            .context("no PLL solution for the target frequency")?;
+        // What each chip should answer. The registers answer as
+        // written, except PLL_DIVIDER bit 31, the lock report
+        // (LOCKED), which a healthy chip answers set after the ramp.
+        let expected = [
+            Register::MiscControl(self.config.misc_control),
+            Register::TicketMask(ticket_mask),
+            Register::PllDivider(PllDivider {
+                locked: true,
+                ..target_pll
+            }),
+        ];
+        let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
+        let mut client = RegisterClient::new(&mut self.chip_commands, register_responses);
+        for address in addresses {
+            for register in &expected {
+                let actual = client
+                    .read(address, register.address())
+                    .await
+                    .context("bring-up verification read failed")?;
+                if actual != *register {
+                    bail!(
+                        "chip 0x{address:02x} readback mismatch: \
+                         expected {register:?}, read {actual:?}"
+                    );
+                }
+            }
+        }
+        debug!("Chain configuration verified");
+
+        Ok(())
+    }
+
+    /// Handles one nonce report from the chips.
+    async fn handle_nonce(&mut self, nonce_response: NonceResponse) {
+        let NonceResponse {
+            nonce,
+            job_id,
+            version,
+            excess_difficulty,
+            subcore_id,
+        } = nonce_response;
+
+        // Look up the task for this job_id
+        if let Some(task) = self.chip_jobs.get(job_id) {
+            let template = task.template.as_ref();
+
+            // Reconstruct full version from rolling field
+            let full_version = version.apply_to_version(template.version.base());
+
+            // Compute merkle root for this task's EN2
+            match task
+                .en2
+                .as_ref()
+                .and_then(|en2| template.compute_merkle_root(en2).ok())
+            {
+                Some(merkle_root) => {
+                    // Build block header
+                    let header = BlockHeader {
+                        version: full_version,
+                        prev_blockhash: template.prev_blockhash,
+                        merkle_root,
+                        time: task.ntime,
+                        bits: template.bits,
+                        nonce,
+                    };
+
+                    // Compute hash
+                    let hash = header.block_hash();
+
+                    // Validate against task share target
+                    if task.share_target.is_met_by(hash) {
+                        // Attribute work at the harder of the
+                        // ASIC ticket mask and the scheduler
+                        // target, since the actual filter is
+                        // whichever is stricter.
+                        let expected_work =
+                            max(self.asic_difficulty.to_work(), task.share_target.to_work());
+
+                        let share = Share {
+                            nonce,
+                            hash,
+                            version: full_version,
+                            ntime: task.ntime,
+                            extranonce2: task.en2,
+                            expected_work,
+                        };
+
+                        // Send via task's dedicated channel
+                        if task.share_tx.send(share).await.is_err() {
+                            // Channel closed = task replaced, share is stale
+                            debug!("Share channel closed (task replaced)");
+                        } else {
+                            debug!(
+                                chip_job_id = job_id,
+                                nonce = format!("{:#x}", nonce),
+                                hash = %hash,
+                                hash_diff = %Difficulty::from_hash(&hash),
+                                target_diff = %Difficulty::from_target(task.share_target),
+                                "Share found and sent"
+                            );
+                        }
+                    } else {
+                        trace!(
+                            chip_job_id = job_id,
+                            nonce = format!("{:#x}", nonce),
+                            hash = %hash,
+                            hash_diff = %Difficulty::from_hash(&hash),
+                            target_diff = %Difficulty::from_target(task.share_target),
+                            "Nonce does not meet target (filtered)"
+                        );
+                    }
+                }
+                None => {
+                    error!(
+                        chip_job_id = job_id,
+                        "Failed to compute merkle root for nonce"
+                    );
+                }
+            }
+        } else {
+            trace!(
+                chip_job_id = job_id,
+                nonce = format!("{:#x}", nonce),
+                "Nonce for unknown job_id (possibly stale)"
+            );
+        }
+
+        let _ = (excess_difficulty, subcore_id); // Unused for now
+    }
+
+    /// Rolls the current task's ntime forward and sends the job to
+    /// the chip.
+    async fn roll_ntime(&mut self) {
+        let task = self.current_task.as_mut().unwrap();
+
+        // Increment ntime
+        task.ntime += 1;
+
+        // Convert to chip format and send
+        match task_to_job_full(task, self.chip_jobs.insert(task.clone())) {
+            Ok(job_data) => {
+                if let Err(e) = self.chip_commands.send(JobCommand::JobFull(job_data)).await {
+                    error!(error = ?e, "Failed to send JobFull to chip");
+                } else {
+                    trace!(ntime = task.ntime, "Sent ntime-rolled job to chip");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to convert task to JobFull");
+            }
+        }
+    }
+
+    /// Updates the shared active flag.
+    fn set_active(&self, is_active: bool) {
+        self.status.write().unwrap().is_active = is_active;
+    }
 }
 
-/// Generate frequency ramp steps for smooth PLL transitions
-fn generate_frequency_ramp_steps(
-    start_mhz: f32,
-    target_mhz: f32,
-    step_mhz: f32,
-) -> Vec<protocol::PllConfig> {
-    let mut configs = Vec::new();
-    let mut current = start_mhz;
+/// Tracks tasks sent to chip hardware, indexed by chip_job_id.
+///
+/// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
+/// HashTasks sent to the chip so we can match nonce responses back to the
+/// correct task context (EN2, ntime, etc.).
+struct ChipJobTracker {
+    tasks: [Option<HashTask>; 16],
+    next_id: u8,
+}
 
-    while current <= target_mhz {
-        if let Some(config) = calculate_pll_for_frequency(current) {
-            configs.push(config);
-        }
-        current += step_mhz;
-        if current > target_mhz && (current - step_mhz) < target_mhz {
-            current = target_mhz;
+impl ChipJobTracker {
+    fn new() -> Self {
+        Self {
+            tasks: Default::default(),
+            next_id: 0,
         }
     }
 
-    configs
+    fn insert(&mut self, task: HashTask) -> u8 {
+        let chip_job_id = self.next_id;
+        self.tasks[chip_job_id as usize] = Some(task);
+        self.next_id = (self.next_id + 1) % (self.tasks.len() as u8);
+        chip_job_id
+    }
+
+    fn get(&self, chip_job_id: u8) -> Option<&HashTask> {
+        self.tasks
+            .get(chip_job_id as usize)
+            .and_then(|t| t.as_ref())
+    }
+
+    fn clear(&mut self) {
+        self.tasks = Default::default();
+    }
 }
 
 /// Convert HashTask to JobFullFormat for chip hardware.
@@ -990,7 +1052,7 @@ fn generate_frequency_ramp_steps(
 /// Extracts or computes the merkle root, then builds a JobFullFormat with all
 /// block header fields. For computed merkle roots, requires EN2. For fixed merkle
 /// roots (Stratum v2 header-only), uses the template's fixed value directly.
-fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFullFormat> {
+fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
     use crate::job_source::MerkleRootKind;
 
     let template = task.template.as_ref();
@@ -1012,7 +1074,7 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
         MerkleRootKind::Fixed(merkle_root) => *merkle_root,
     };
 
-    Ok(protocol::JobFullFormat {
+    Ok(JobFullFormat {
         job_id: chip_job_id,
         num_midstates: 1,
         starting_nonce: 0,
@@ -1024,71 +1086,362 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
     })
 }
 
-/// Calculate PLL configuration for a specific frequency
-fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> {
-    const CRYSTAL_FREQ: f32 = 25.0;
-    const MAX_FREQ_ERROR: f32 = 1.0;
+/// Initialize a chain of `chip_count` BM1366 chips (Antminer S19K Pro
+/// AM3-style boards) for mining.
+///
+/// The sequence is real, captured wire data (via a ptrace syscall
+/// tracer against `bosminer`'s own successful bring-up -- see
+/// `docs/s19k-pro/reference/full-engineering-log.md`'s Round 4/5/6),
+/// not a guessed-at adaptation of any other chip's sequence -- BM1366's
+/// actual required order and register values differ genuinely, not
+/// just in tuning constants. See [`Bm1366ChainBringUp`]'s doc comment
+/// for why this stays a standalone function instead of new
+/// `ChipConfig` fields on the shared `Actor::initialize_chain` path.
+///
+/// **This sequence has mined, but does not out of the box today.**
+/// Real `Nonce` responses decoded and the pool accepted real shares in
+/// Round 12, and Round 14 confirmed ~4-6 TH/s at ~300 MHz. A fresh
+/// build run on real hardware on 2026-08-27 completed the whole
+/// sequence below --- all 231 chips addressed, per-chip pass sent,
+/// baud switched, chains enabled, the ramp below run to its 575 MHz
+/// target, pool connected --- and then produced **zero nonces in five
+/// minutes, with board temperature flat at ambient**.
+///
+/// That is the retest the notes had been calling for, and it came back
+/// negative: the `Core`/`CoreMailbox` byte-order fix is present in
+/// this crate and is **not on its own sufficient** to make this driver
+/// hash at 575 MHz. The signature is the one Round 14 recorded for
+/// every frequency above 300 MHz. Whatever else the reference port
+/// does differently has not been identified yet.
+///
+/// What is *not* established for this driver is frequency headroom.
+/// Every frequency above ~300 MHz failed identically here -- flat
+/// temperature, zero nonces -- and Round 15 found why: a byte-order bug
+/// on the `Core`/`CoreMailbox` register left it decoding little-endian
+/// where the wire encoding is big-endian, so `CORE_MAILBOX`'s "apply
+/// to all cores" bit never applied chain-wide. `CoreCommand::decode`
+/// in `register.rs` already decodes big-endian, so that fix carries
+/// forward automatically here -- but the ~105 TH/s at 575MHz that
+/// proved the fix mattered was measured against the *reference* port,
+/// not this driver, which has not been retested above 300 MHz since.
+/// Any shortfall now is a driver bug, not a hardware limit.
+///
+/// One naming correction made while porting this to the current
+/// register set: the broadcast write this function always called
+/// "NonceRange" (captured at wire address `0x10`) decodes to
+/// `RegisterAddress::HashCountingNumber` here, not a `NonceRange`
+/// register -- there is no such register in this codebase's more
+/// carefully cross-referenced (against real firmware source) register
+/// map. The exact captured bytes (`0x5a10_0000`) are unchanged; only
+/// the type/name sending them is now the real one.
+///
+/// Specifics worth knowing before changing any of this:
+/// - Switches to `bosminer`'s real 3,125,000 operating baud when the
+///   caller supplies a [`BaudControl`], which the S19K Pro board driver
+///   does. Round 8 tested the switch on real hardware: it changed
+///   nothing by itself, but the investigation found and removed a real
+///   corruption source. Uses the exact captured `UartBaud` wire value
+///   (`0x00003011`), not this module's `UartBaud::for_baud`, which
+///   computes from a target rate and was not verified to reproduce
+///   this exact captured value. With no `BaudControl`, stays at the
+///   discovery-time 115200 baud throughout.
+/// - Sends the per-chip addressed `SoftResetControl`/`MiscControl`/
+///   `CoreMailbox` pass with the real captured values, which genuinely
+///   differ from the broadcast ones (`00 07 01 f0` / `f0 00 c1 00`,
+///   and the `CoreMailbox` triplet in its captured order). Round 10
+///   sent this addressed but reused the broadcast-phase data verbatim,
+///   since this board's real per-chip values were unknown/uncaptured
+///   at the time -- that round shipped and tested clean, but still
+///   produced zero Nonce responses. Round 12 went back to the original
+///   bosminer wire capture and searched it specifically for
+///   *addressed* (non-broadcast) writes -- a query never run before.
+///   It turns out the real per-chip values genuinely differ from the
+///   broadcast ones, and the real CoreMailbox triplet order is
+///   different from what Round 10 guessed. Confirmed identical across
+///   all 77 chip addresses (0x00..=0x98) on ttyS1 -- these are fixed
+///   values applied to every chip, not per-address-varying data.
+async fn initialize_chip_bm1366_chain<W>(
+    chip_count: u8,
+    domain_config: &[DomainConfigWrite],
+    baud_control: Option<&dyn BaudControl>,
+    chip_commands: &mut W,
+    peripherals: &mut BoardPeripherals,
+    asic_difficulty: Log2Difficulty,
+) -> Result<()>
+where
+    W: ChipCommandSink + Unpin,
+    SinkError<W>: std::error::Error + Send + Sync + 'static,
+{
+    debug!("Releasing chip reset");
+    peripherals
+        .reset_line
+        .release()
+        .await
+        .context("failed to release chip reset")?;
 
-    let mut best_fb_div = 0u8;
-    let mut best_ref_div = 0u8;
-    let mut best_post_div1 = 0u8;
-    let mut best_post_div2 = 0u8;
-    let mut min_error = 10.0;
+    time::sleep(Duration::from_millis(200)).await;
 
-    for ref_div in [2, 1] {
-        if best_fb_div != 0 {
+    async fn send_broadcast<W>(chip_commands: &mut W, register: Register) -> Result<()>
+    where
+        W: ChipCommandSink + Unpin,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
+    {
+        chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register,
+            }))
+            .await
+            .context("failed to send broadcast register write")
+    }
+
+    debug!("Configuring version mask");
+    for _ in 0..3 {
+        send_broadcast(
+            chip_commands,
+            Register::MidstateConfig(MidstateConfig::full_rolling()),
+        )
+        .await
+        .context("failed to send MidstateConfig")?;
+        time::sleep(Duration::from_millis(15)).await;
+    }
+
+    send_broadcast(
+        chip_commands,
+        Register::SoftResetControl(SoftResetControl::decode([0x00, 0x07, 0x00, 0x00])),
+    )
+    .await
+    .context("failed to send SoftResetControl")?;
+    time::sleep(Duration::from_millis(15)).await;
+
+    send_broadcast(
+        chip_commands,
+        Register::MiscControl(MiscControl::decode([0xff, 0x0f, 0xc1, 0x00])),
+    )
+    .await
+    .context("failed to send MiscControl")?;
+    time::sleep(Duration::from_millis(15)).await;
+
+    debug!("Sending ChainInactive");
+    for _ in 0..3 {
+        chip_commands
+            .send(RegisterCommand::ChainInactive(ChainInactive))
+            .await
+            .context("failed to send ChainInactive")?;
+        time::sleep(Duration::from_millis(15)).await;
+    }
+
+    debug!(chip_count, "Sweeping SetChipAddress");
+    for i in 0..chip_count as u16 {
+        let chip_address = (i * 2) as u8;
+        chip_commands
+            .send(RegisterCommand::SetChipAddress(SetChipAddress {
+                chip_address,
+            }))
+            .await
+            .context("failed to send SetChipAddress")?;
+        time::sleep(Duration::from_millis(2)).await;
+    }
+
+    debug!("Sending broadcast core configuration (CoreMailbox)");
+    send_broadcast(
+        chip_commands,
+        Register::CoreMailbox(CoreCommand::decode([0x80, 0x00, 0x85, 0x40])),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::CoreMailbox(CoreCommand::decode([0x80, 0x00, 0x80, 0x20])),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::AnalogMux(AnalogMux::decode([0x00, 0x00, 0x00, 0x03])),
+    )
+    .await?;
+    send_broadcast(
+        chip_commands,
+        Register::IoDriverStrength(IoDriverStrength::decode([0x02, 0x11, 0x41, 0x11])),
+    )
+    .await?;
+
+    debug!(
+        chip_count,
+        "Sending per-chip SoftResetControl/MiscControl/CoreMailbox pass"
+    );
+    for i in 0..chip_count as u16 {
+        let chip_address = (i * 2) as u8;
+        let destination = Destination::Chip(chip_address);
+        chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination,
+                register: Register::SoftResetControl(SoftResetControl::decode([
+                    0x00, 0x07, 0x01, 0xf0,
+                ])),
+            }))
+            .await
+            .context("failed to send per-chip SoftResetControl")?;
+        time::sleep(Duration::from_millis(2)).await;
+        chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination,
+                register: Register::MiscControl(MiscControl::decode([0xf0, 0x00, 0xc1, 0x00])),
+            }))
+            .await
+            .context("failed to send per-chip MiscControl")?;
+        time::sleep(Duration::from_millis(2)).await;
+        for data in [
+            [0x80u8, 0x00, 0x80, 0x20], // reg 0x00 clock delay = 0x20
+            [0x80, 0x00, 0x82, 0xaa],   // reg 0x02 core enable = 0xAA
+            [0x80, 0x00, 0x85, 0x40],   // reg 0x05 clock select = 0x40
+        ] {
+            chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::decode(data)),
+                }))
+                .await
+                .context("failed to send per-chip CoreMailbox write")?;
+            time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    debug!(
+        writes = domain_config.len(),
+        "Sending per-chip domain config writes"
+    );
+    for &(chip_address, register_address, data) in domain_config {
+        let register = Register::decode(register_address, data)
+            .context("failed to decode domain config register")?;
+        chip_commands
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Chip(chip_address),
+                register,
+            }))
+            .await
+            .context("failed to send domain config write")?;
+        time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Rounds 12-14 (see the engineering log) tried five real
+    // hypotheses for why nothing above ~300MHz produced real hashing
+    // (flat temperature, zero nonces despite clean communication) --
+    // fb_div range, ramp granularity, VCO stability mid-ramp, settle
+    // time, post-divider preservation -- all ruled out. A real,
+    // independently-developed reference (github.com/Schnitzel/mujina,
+    // amlogic-s19kpro-support branch, with its own real hardware
+    // testing on this exact BHB56902/S19K Pro hashboard) found two
+    // real bugs and one real structural difference:
+    //
+    // 1. BM1366 requires strict `post_div1 > post_div2`, not `>=`.
+    //    Sourced from bitaxeorg/ESP-Miner's real firmware
+    //    (`components/asic/bm1366.c`'s `pll_get_parameters`), not a
+    //    guess -- see `calculate_pll_bm1366` below, which fixes it.
+    // 2. This exact hashboard's real factory operating voltage is
+    //    13.9V -- see `PSU_TARGET_VOLTS` in `board/antminer_s19k_am3.rs`.
+    // 3. **The frequency ramp runs last**, after TicketMask/the
+    //    HashCountingNumber write and the baud switch, not before
+    //    them.
+    //
+    // TicketMask, the HashCountingNumber write, and the baud switch
+    // now run immediately after the per-chip pass and domain config,
+    // before frequency ramping -- matching the reference's real,
+    // working order.
+    let ticket_mask = TicketMask::new(asic_difficulty);
+    send_broadcast(chip_commands, Register::TicketMask(ticket_mask))
+        .await
+        .context("failed to send TicketMask")?;
+
+    // Real BM1366 value at wire address 0x10, captured from a working
+    // reference bring-up. See this function's doc comment for why this
+    // is sent as HashCountingNumber, not a "NonceRange" register.
+    send_broadcast(
+        chip_commands,
+        Register::HashCountingNumber(HashCountingNumber::from(0x5a10_0000u32)),
+    )
+    .await
+    .context("failed to send HashCountingNumber")?;
+
+    time::sleep(Duration::from_millis(150)).await;
+
+    // Switch to bosminer's real confirmed operating baud (3,125,000),
+    // if the board supports it. Two things have to happen in order:
+    // tell the chips via the real captured UartBaud value first (NOT
+    // this module's UartBaud::for_baud, which was not verified to
+    // reproduce this exact captured value), *then* reconfigure the
+    // host tty to match -- reversing the order would leave the host
+    // talking at the old rate to chips already listening at the new
+    // one.
+    if let Some(baud_control) = baud_control {
+        const REAL_OPERATING_BAUD: u32 = 3_125_000;
+
+        debug!(
+            baud = REAL_OPERATING_BAUD,
+            "Switching to real operating baud"
+        );
+        send_broadcast(
+            chip_commands,
+            Register::UartBaud(UartBaud::decode([0x00, 0x00, 0x30, 0x11])),
+        )
+        .await
+        .context("failed to send UartBaud")?;
+        time::sleep(Duration::from_millis(50)).await;
+
+        baud_control
+            .set_baud_rate(REAL_OPERATING_BAUD)
+            .context("failed to switch host tty to real operating baud")?;
+        time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Frequency ramp -- deliberately last. Targets 575MHz: the
+    // reference's own real hardware measurement on this exact chip
+    // family (39.68 TH/s on mujina itself, LuxOS gets 39.15-39.33
+    // TH/s at the same point) -- deliberately not the 645MHz factory
+    // ceiling, which their notes call "right at the edge of
+    // stability" (645MHz measured *less* hashrate than 575MHz).
+    const TARGET_MHZ: f32 = 575.0;
+    const RAMP_STEP_MHZ: f32 = 6.25;
+    const RAMP_STEP_DELAY: Duration = Duration::from_millis(100);
+
+    debug!(
+        target_mhz = TARGET_MHZ,
+        step_mhz = RAMP_STEP_MHZ,
+        "Ramping frequency"
+    );
+    let mut mhz = 56.25f32;
+    loop {
+        mhz = if mhz + RAMP_STEP_MHZ < TARGET_MHZ {
+            mhz + RAMP_STEP_MHZ
+        } else {
+            TARGET_MHZ
+        };
+        let pll = calculate_pll_bm1366(mhz)
+            .with_context(|| format!("no valid BM1366 PLL config for {mhz}MHz"))?;
+        send_broadcast(chip_commands, Register::PllDivider(pll))
+            .await
+            .with_context(|| format!("failed to send PllDivider for {mhz}MHz ramp step"))?;
+        time::sleep(RAMP_STEP_DELAY).await;
+        if mhz >= TARGET_MHZ {
             break;
         }
-        for post_div1 in (1..=7).rev() {
-            if best_fb_div != 0 {
-                break;
-            }
-            for post_div2 in (1..=7).rev() {
-                if best_fb_div != 0 {
-                    break;
-                }
-                if post_div1 >= post_div2 {
-                    let fb_div_f = (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
-                        / CRYSTAL_FREQ;
-                    let fb_div = fb_div_f.round() as u8;
-
-                    if (0xa0..=0xef).contains(&fb_div) {
-                        let actual_freq =
-                            CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
-                        let error = (actual_freq - target_freq).abs();
-
-                        if error < min_error && error < MAX_FREQ_ERROR {
-                            best_fb_div = fb_div;
-                            best_ref_div = ref_div;
-                            best_post_div1 = post_div1;
-                            best_post_div2 = post_div2;
-                            min_error = error;
-                        }
-                    }
-                }
-            }
-        }
     }
+    debug!(mhz, "Frequency ramp complete");
 
-    if best_fb_div == 0 {
-        return None;
-    }
-
-    let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
-    Some(protocol::PllConfig::new(
-        best_fb_div,
-        best_ref_div,
-        post_div,
-    ))
+    Ok(())
 }
 
 /// Calculate a PLL configuration for a target frequency, for BM1366
-/// (this board's real chips, per `ChipId`). Two constraints that
-/// differ from `calculate_pll_for_frequency` above (which backs the
-/// proven Bitaxe/BM1370 path and is left untouched):
+/// (Antminer S19K Pro). Kept standalone rather than added to
+/// `ChipConfig::calculate_pll`'s shared search (see
+/// `chip_config.rs`'s `PllParams` doc comment: post-divider ordering
+/// is "shared across the family and hardcoded in the search loop") --
+/// the constraint below is stricter than that shared loop enforces,
+/// and changing the shared loop for one still-unverified chip model
+/// risks silently changing PLL output for the models that already
+/// work. Two things differ from a naive port of that search:
 ///
-/// - fb_div range `0x90..=0xEB`, not BM1370's `0xA0..=0xEF`
-///   (REFERENCE.md's PLL_DIVIDER section).
+/// - fb_div range `0x90..=0xEB` (REFERENCE.md's PLL_DIVIDER section
+///   for BM1366), not another model's range.
 /// - **Strict `post_div1 > post_div2`**, not `>=`. Sourced from
 ///   bitaxeorg/ESP-Miner's real firmware (`components/asic/bm1366.c`,
 ///   `pll_get_parameters(target, 144, 235, ...)`) via a real,
@@ -1102,7 +1455,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 /// Prefers the lowest-VCO valid solution when multiple exist, same
 /// rationale as the reference: keeps the VCO in BM1366's typical
 /// ~2000-2300MHz operating range rather than an arbitrary higher one.
-fn calculate_pll_bm1366(target_freq: f32) -> Option<protocol::PllConfig> {
+fn calculate_pll_bm1366(target_freq: f32) -> Option<PllDivider> {
     const CRYSTAL_FREQ: f32 = 25.0;
     const MAX_FREQ_ERROR: f32 = 1.0;
     const FB_DIV_MIN: u8 = 0x90;
@@ -1139,438 +1492,84 @@ fn calculate_pll_bm1366(target_freq: f32) -> Option<protocol::PllConfig> {
 
     let (fb_div, ref_div, post_div1, post_div2) = best?;
     let post_div = ((post_div1 - 1) << 4) | (post_div2 - 1);
-    Some(protocol::PllConfig::new(fb_div, ref_div, post_div))
+    Some(PllDivider::new(fb_div, ref_div, post_div))
 }
 
-/// Internal actor task for BM13xxThread.
-///
-/// This runs as an independent Tokio task and handles:
-/// - Commands from scheduler (update/replace work, go idle, shutdown)
-/// - Removal signal from board (USB unplug, fault, etc.)
-/// - Chip initialization (lazy, on first work assignment)
-/// - Serial communication with chips
-/// - Share filtering and event emission (TODO)
-///
-/// Chip is disabled on startup to establish known state. Chip is enabled and
-/// configured when scheduler assigns first work.
-#[expect(clippy::too_many_arguments)]
-async fn bm13xx_thread_actor<R, W>(
-    mut cmd_rx: mpsc::Receiver<ThreadCommand>,
-    evt_tx: mpsc::Sender<HashThreadEvent>,
-    mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
-    status: Arc<RwLock<HashThreadStatus>>,
-    mut chip_responses: R,
-    mut chip_commands: W,
-    mut peripherals: BoardPeripherals,
-    init_strategy: ChipInitStrategy,
-) where
-    R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
-{
-    // Disable ASIC on startup to establish known state
-    if let Some(ref mut asic_enable) = peripherals.asic_enable
-        && let Err(e) = asic_enable.disable().await
-    {
-        warn!(error = %e, "Failed to disable ASIC on startup");
-    }
+/// Generate frequency ramp steps for smooth PLL transitions
+fn generate_frequency_ramp_steps(
+    config: &ChipConfig,
+    range: RangeInclusive<Frequency>,
+    step: Frequency,
+) -> Vec<PllDivider> {
+    let target = *range.end();
+    let mut configs = Vec::new();
+    let mut current = *range.start();
 
-    // ASIC ticket mask difficulty: ~1 nonce/sec at 1 TH/s
-    let asic_difficulty = Log2Difficulty::from_difficulty(
-        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
-    );
-
-    let mut chip_initialized = false;
-    let mut current_task: Option<HashTask> = None;
-    let mut chip_jobs = ChipJobTracker::new();
-    let mut ntime_ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
-    ntime_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            // Removal signal (highest priority)
-            _ = removal_rx.changed() => {
-                let signal = removal_rx.borrow().clone();  // Clone to avoid holding borrow across await
-                match signal {
-                    ThreadRemovalSignal::Running => {
-                        // False alarm - still running
-                    }
-                    _reason => {
-                        // Update status
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = false;
-                        }
-
-                        // Exit actor loop (channel closure signals removal to scheduler)
-                        break;
-                    }
-                }
-            }
-
-            // Commands from scheduler
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    ThreadCommand::Configure => {
-                        // Nameplate rate for one BM1370 chip; a rough stand-in
-                        // for a real frequency-derived estimate.
-                        let expected = HashRate::from_terahashes(1.0);
-                        if evt_tx.send(HashThreadEvent::ExpectedHashRate(expected)).await.is_err() {
-                            debug!("Event channel closed during configure");
-                        }
-                    }
-
-                    ThreadCommand::UpdateTask { new_task, response_tx } => {
-                        if let Some(ref old) = current_task {
-                            debug!(
-                                old_job = %old.template.id,
-                                new_job = %new_task.template.id,
-                                "Updating work"
-                            );
-                        } else {
-                            debug!(new_job = %new_task.template.id, "Updating work from idle");
-                        }
-
-                        if !chip_initialized {
-                            trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&init_strategy, &mut chip_commands, &mut peripherals, asic_difficulty).await {
-                                error!(error = %e, "Chip initialization failed");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                            chip_initialized = true;
-                        }
-
-                        // Send initial job to chip
-                        let chip_job_id = chip_jobs.insert(new_task.clone());
-                        let old_task = current_task.replace(new_task.clone());
-                        match task_to_job_full(&new_task, chip_job_id) {
-                            Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
-                                    error!(error = ?e, "Failed to send initial JobFull to chip");
-                                    let err = anyhow!("failed to send job to chip: {e:?}");
-                                    response_tx.send(Err(err)).ok();
-                                    continue;
-                                } else {
-                                    debug!("Sent initial job to chip");
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Failed to convert task to JobFull");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                        }
-
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = true;
-                        }
-
-                        response_tx.send(Ok(old_task)).ok();
-                    }
-
-                    ThreadCommand::ReplaceTask { new_task, response_tx } => {
-                        if let Some(ref old) = current_task {
-                            debug!(
-                                old_job = %old.template.id,
-                                new_job = %new_task.template.id,
-                                "Replacing work"
-                            );
-                        } else {
-                            debug!(new_job = %new_task.template.id, "Replacing work from idle");
-                        }
-
-                        if !chip_initialized {
-                            trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&init_strategy, &mut chip_commands, &mut peripherals, asic_difficulty).await {
-                                error!(error = %e, "Chip initialization failed");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                            chip_initialized = true;
-                        }
-
-                        // Clear old jobs (old shares invalid)
-                        chip_jobs.clear();
-
-                        // Send initial job to chip
-                        let chip_job_id = chip_jobs.insert(new_task.clone());
-                        let old_task = current_task.replace(new_task.clone());
-                        match task_to_job_full(&new_task, chip_job_id) {
-                            Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
-                                    error!(error = ?e, "Failed to send initial JobFull to chip");
-                                    let err = anyhow!("failed to send job to chip: {e:?}");
-                                    response_tx.send(Err(err)).ok();
-                                    continue;
-                                } else {
-                                    debug!("Sent initial job to chip (old work invalidated)");
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Failed to convert task to JobFull");
-                                response_tx.send(Err(e)).ok();
-                                continue;
-                            }
-                        }
-
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = true;
-                        }
-
-                        response_tx.send(Ok(old_task)).ok();
-                    }
-
-                    ThreadCommand::GoIdle { response_tx } => {
-                        debug!("Going idle");
-
-                        let old_task = current_task.take();
-
-                        {
-                            let mut s = status.write().unwrap();
-                            s.is_active = false;
-                        }
-
-                        response_tx.send(Ok(old_task)).ok();
-                    }
-
-                    ThreadCommand::Shutdown => {
-                        info!("Shutdown command received");
-                        // Exit actor loop (channel closure signals shutdown to scheduler)
-                        break;
-                    }
-                }
-            }
-
-            // Chip responses from serial stream
-            Some(result) = chip_responses.next() => {
-                match result {
-                    Ok(response) => {
-                        match response {
-                            protocol::Response::Nonce { nonce, job_id, version, midstate_num, subcore_id } => {
-                                // Look up the task for this job_id
-                                if let Some(task) = chip_jobs.get(job_id) {
-                                    let template = task.template.as_ref();
-
-                                    // Reconstruct full version from rolling field
-                                    let full_version = version.apply_to_version(template.version.base());
-
-                                    // Compute merkle root for this task's EN2
-                                    match task.en2.as_ref().and_then(|en2| template.compute_merkle_root(en2).ok()) {
-                                        Some(merkle_root) => {
-                                            // Build block header
-                                            let header = BlockHeader {
-                                                version: full_version,
-                                                prev_blockhash: template.prev_blockhash,
-                                                merkle_root,
-                                                time: task.ntime,
-                                                bits: template.bits,
-                                                nonce,
-                                            };
-
-                                            // Compute hash
-                                            let hash = header.block_hash();
-
-                                            // Validate against task share target
-                                            if task.share_target.is_met_by(hash) {
-                                                // Attribute work at the harder of the
-                                                // ASIC ticket mask and the scheduler
-                                                // target, since the actual filter is
-                                                // whichever is stricter.
-                                                let expected_work = max(
-                                                    asic_difficulty.to_work(),
-                                                    task.share_target.to_work(),
-                                                );
-
-                                                let share = Share {
-                                                    nonce,
-                                                    hash,
-                                                    version: full_version,
-                                                    ntime: task.ntime,
-                                                    extranonce2: task.en2,
-                                                    expected_work,
-                                                };
-
-                                                // Send via task's dedicated channel
-                                                if task.share_tx.send(share).await.is_err() {
-                                                    // Channel closed = task replaced, share is stale
-                                                    debug!("Share channel closed (task replaced)");
-                                                } else {
-                                                    debug!(
-                                                        chip_job_id = job_id,
-                                                        nonce = format!("{:#x}", nonce),
-                                                        hash = %hash,
-                                                        hash_diff = %Difficulty::from_hash(&hash),
-                                                        target_diff = %Difficulty::from_target(task.share_target),
-                                                        "Share found and sent"
-                                                    );
-                                                }
-                                            } else {
-                                                trace!(
-                                                    chip_job_id = job_id,
-                                                    nonce = format!("{:#x}", nonce),
-                                                    hash = %hash,
-                                                    hash_diff = %Difficulty::from_hash(&hash),
-                                                    target_diff = %Difficulty::from_target(task.share_target),
-                                                    "Nonce does not meet target (filtered)"
-                                                );
-                                            }
-                                        }
-                                        None => {
-                                            error!(
-                                                chip_job_id = job_id,
-                                                "Failed to compute merkle root for nonce"
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    trace!(
-                                        chip_job_id = job_id,
-                                        nonce = format!("{:#x}", nonce),
-                                        "Nonce for unknown job_id (possibly stale)"
-                                    );
-                                }
-
-                                let _ = (midstate_num, subcore_id); // Unused for now
-                            }
-
-                            protocol::Response::ReadRegister { chip_address, register } => {
-                                trace!(chip_address = %format!("0x{:02x}", chip_address), register = ?register, "Register read response");
-                            }
-                        }
-                    }
-
-                    Err(e) => {
-                        error!(error = ?e, "Serial decode error");
-                        // TODO: Emit error event, potentially trigger going offline if persistent
-                    }
-                }
-            }
-
-            // ntime rolling timer (roll forward every second)
-            _ = ntime_ticker.tick(), if current_task.is_some() => {
-                let task = current_task.as_mut().unwrap();
-
-                // Increment ntime
-                task.ntime += 1;
-
-                // Convert to chip format and send
-                match task_to_job_full(task, chip_jobs.insert(task.clone())) {
-                    Ok(job_data) => {
-                        if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
-                            error!(error = ?e, "Failed to send JobFull to chip");
-                        } else {
-                            trace!(ntime = task.ntime, "Sent ntime-rolled job to chip");
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to convert task to JobFull");
-                    }
-                }
-            }
+    while current <= target {
+        if let Some(pll) = config.calculate_pll(current) {
+            configs.push(pll);
         }
+        let next = Frequency::from_hz(current.hz() + step.hz());
+        // A final short step ends the ramp exactly on the target
+        current = if next > target && current < target {
+            target
+        } else {
+            next
+        };
     }
 
-    debug!("BM13xx thread actor exiting");
+    configs
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use futures::{Sink, stream};
+
     use super::*;
+    use crate::asic::bm13xx::chip_config;
+    use crate::asic::bm13xx::peripherals::ResetLine;
+    use crate::peripheral::regulator::VoltageRegulator;
+    use crate::types::Voltage;
 
     #[test]
-    fn test_pll_calculations_match_reference() {
-        // Test cases from the Bitaxe Gamma protocol capture
-        // Format: (freq_mhz, expected_flag, expected_fb_div, expected_ref_div, expected_post_div)
-        let test_cases = vec![
-            (62.50, 0x50, 0xD2, 0x02, 0x65),
-            (68.75, 0x50, 0xE7, 0x02, 0x65),
-            (75.00, 0x50, 0xD2, 0x02, 0x64),
-            (81.25, 0x50, 0xE4, 0x02, 0x64),
-            (87.50, 0x50, 0xC4, 0x02, 0x63),
-            (93.75, 0x50, 0xD2, 0x02, 0x63),
-            (100.00, 0x50, 0xE0, 0x02, 0x63),
-            (525.00, 0x50, 0xD2, 0x02, 0x40),
+    fn ramp_covers_range_in_steps() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(56.25)..=Frequency::from_mhz(525.0),
+            Frequency::from_mhz(6.25),
+        );
+
+        // 75 steps of 6.25 MHz above the starting frequency
+        assert_eq!(steps.len(), 76);
+
+        // Each step is the solver's answer for the next stepped
+        // frequency
+        for (i, step) in steps.iter().enumerate() {
+            let freq = Frequency::from_hz(56_250_000 + i as u64 * 6_250_000);
+            assert_eq!(*step, config.calculate_pll(freq).unwrap(), "step {i}");
+        }
+    }
+
+    #[test]
+    fn ramp_ends_on_target_when_step_overshoots() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(56.25)..=Frequency::from_mhz(60.0),
+            Frequency::from_mhz(6.25),
+        );
+
+        let expected = [
+            config.calculate_pll(Frequency::from_mhz(56.25)).unwrap(),
+            config.calculate_pll(Frequency::from_mhz(60.0)).unwrap(),
         ];
-
-        for (freq_mhz, expected_flag, expected_fb, expected_ref, expected_post) in test_cases {
-            let config = calculate_pll_for_frequency(freq_mhz)
-                .unwrap_or_else(|| panic!("Failed to calculate PLL for {} MHz", freq_mhz));
-
-            assert_eq!(
-                config.flag, expected_flag,
-                "Flag mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_flag, config.flag
-            );
-            assert_eq!(
-                config.fb_div, expected_fb,
-                "FB divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_fb, config.fb_div
-            );
-            assert_eq!(
-                config.ref_div, expected_ref,
-                "Ref divider mismatch for {} MHz: expected {}, got {}",
-                freq_mhz, expected_ref, config.ref_div
-            );
-            assert_eq!(
-                config.post_div, expected_post,
-                "Post divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_post, config.post_div
-            );
-
-            let post_div1 = ((config.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (config.post_div & 0xF) + 1;
-            let calculated_freq =
-                25.0 * config.fb_div as f32 / (config.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (calculated_freq - freq_mhz).abs() < 1.0,
-                "Frequency calculation error for {} MHz: calculated {} MHz",
-                freq_mhz,
-                calculated_freq
-            );
-        }
-    }
-
-    #[test]
-    fn test_frequency_ramp_generation() {
-        let steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
-
-        // (525 - 56.25) / 6.25 + 1 = 76 steps
-        assert_eq!(steps.len(), 76, "Expected 76 frequency steps");
-
-        if let Some(first) = steps.first() {
-            let post_div1 = ((first.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (first.post_div & 0xF) + 1;
-            let first_freq =
-                25.0 * first.fb_div as f32 / (first.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (first_freq - 56.25).abs() < 1.0,
-                "First frequency should be ~56.25 MHz"
-            );
-        }
-
-        if let Some(last) = steps.last() {
-            let post_div1 = ((last.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (last.post_div & 0xF) + 1;
-            let last_freq =
-                25.0 * last.fb_div as f32 / (last.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (last_freq - 525.0).abs() < 1.0,
-                "Last frequency should be ~525 MHz"
-            );
-        }
-    }
-
-    #[test]
-    fn test_pll_flag_setting() {
-        // Flag is 0x50 when VCO frequency >= 2400 MHz, 0x40 otherwise
-        let low_freq = calculate_pll_for_frequency(100.0).unwrap();
-        assert_eq!(low_freq.flag, 0x50, "Should have 0x50 flag for 100 MHz");
-
-        let high_freq = calculate_pll_for_frequency(525.0).unwrap();
-        assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 525 MHz");
+        assert_eq!(steps, expected);
     }
 
     #[test]
@@ -1626,5 +1625,308 @@ mod tests {
             *esp_miner_job::wire_tx::PREV_BLOCKHASH
         );
         assert_eq!(result.merkle_root, *esp_miner_job::wire_tx::MERKLE_ROOT);
+    }
+
+    /// Sink that accepts and discards every command.
+    struct NullSink;
+
+    impl Sink<RegisterCommand> for NullSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: RegisterCommand) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<JobCommand> for NullSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: JobCommand) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Sink that is never ready, parking the first send forever.
+    struct StallSink;
+
+    impl Sink<RegisterCommand> for StallSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: RegisterCommand) -> Result<(), io::Error> {
+            unreachable!("poll_ready never succeeds")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<JobCommand> for StallSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: JobCommand) -> Result<(), io::Error> {
+            unreachable!("poll_ready never succeeds")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+    }
+
+    /// Peripheral states observed by the tests.
+    #[derive(Clone, Default)]
+    struct PeripheralFlags {
+        reset_asserted: Arc<AtomicBool>,
+        rail_disabled: Arc<AtomicBool>,
+    }
+
+    struct MockResetLine(PeripheralFlags);
+
+    #[async_trait]
+    impl ResetLine for MockResetLine {
+        async fn assert(&mut self) -> Result<()> {
+            self.0.reset_asserted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn release(&mut self) -> Result<()> {
+            self.0.reset_asserted.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct MockRegulator(PeripheralFlags);
+
+    #[async_trait]
+    impl VoltageRegulator for MockRegulator {
+        async fn enable(&mut self) -> Result<()> {
+            self.0.rail_disabled.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn disable(&mut self) -> Result<()> {
+            self.0.rail_disabled.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_enabled(&mut self) -> Result<bool> {
+            Ok(!self.0.rail_disabled.load(Ordering::SeqCst))
+        }
+
+        async fn set_voltage(&mut self, _voltage: Voltage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_voltage(&mut self) -> Result<Voltage> {
+            Ok(Voltage::from_volts(1.15))
+        }
+    }
+
+    fn spawn_thread<R, W>(
+        chip_responses: R,
+        chip_commands: W,
+    ) -> (BM13xxThread, watch::Sender<()>, PeripheralFlags)
+    where
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
+    {
+        let flags = PeripheralFlags::default();
+        let peripherals = BoardPeripherals {
+            reset_line: Box::new(MockResetLine(flags.clone())),
+            voltage_regulator: Box::new(MockRegulator(flags.clone())),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+
+        let thread = BM13xxThread::new(
+            "test".into(),
+            chip_config::bm1370(),
+            TopologySpec::single_domain(1),
+            chip_responses,
+            chip_commands,
+            peripherals,
+            shutdown_rx,
+            None,
+        );
+
+        (thread, shutdown_tx, flags)
+    }
+
+    /// Builds a minimal task for driving the actor.
+    fn test_task() -> HashTask {
+        use crate::asic::bm13xx::test_data::esp_miner_job;
+        use crate::job_source::{
+            Extranonce2, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
+        };
+
+        let template = Arc::new(JobTemplate {
+            id: "test".into(),
+            prev_blockhash: *esp_miner_job::wire_tx::PREV_BLOCKHASH,
+            version: VersionTemplate::new(
+                *esp_miner_job::wire_tx::VERSION,
+                GeneralPurposeBits::full(),
+            )
+            .expect("Valid version template"),
+            bits: *esp_miner_job::wire_tx::NBITS,
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
+            time: *esp_miner_job::wire_tx::NTIME,
+            merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
+        });
+        let (share_tx, _share_rx) = mpsc::channel(1);
+
+        HashTask {
+            template,
+            en2_range: None,
+            en2: Some(Extranonce2::new(0, 1).unwrap()),
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
+            ntime: *esp_miner_job::wire_tx::NTIME,
+            share_tx,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_response_stream_ends() {
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(stream::iter(Vec::new()), NullSink);
+        let mut events = thread.take_event_receiver().unwrap();
+
+        // The actor disables the chain before it drops its event
+        // sender, so a closed event channel implies the cleanup ran
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_shutdown_sender_drops() {
+        let (mut thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+        let mut events = thread.take_event_receiver().unwrap();
+
+        // Drop the sender without a signal, as a dying board task
+        // would
+        drop(shutdown_tx);
+
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_on_shutdown_signal() {
+        let (_thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+
+        shutdown_tx.send(()).unwrap();
+
+        // The actor drops its shutdown receiver only after disabling
+        // the chain, so a closed sender implies the cleanup ran
+        time::timeout(Duration::from_secs(5), shutdown_tx.closed())
+            .await
+            .expect("actor should drop its shutdown receiver");
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_handle_dropped() {
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+        let mut events = thread.take_event_receiver().unwrap();
+
+        drop(thread);
+
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_bring_up() {
+        // The stalling sink parks bring-up at its first chip
+        // command, holding it in progress until the signal arrives
+        let (mut thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            StallSink,
+        );
+
+        let assign = thread.update_task(test_task());
+        let signal = async {
+            // Bring-up has begun once the startup reset assertion
+            // is released
+            while !flags.reset_asserted.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+            while flags.reset_asserted.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+            shutdown_tx.send(()).unwrap();
+        };
+        let (result, _) = time::timeout(Duration::from_secs(60), async {
+            tokio::join!(assign, signal)
+        })
+        .await
+        .expect("bring-up should abort");
+
+        assert!(result.is_err());
+
+        // The actor exits, disabling the chain on the way out
+        time::timeout(Duration::from_secs(5), shutdown_tx.closed())
+            .await
+            .expect("actor should drop its shutdown receiver");
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
     }
 }
