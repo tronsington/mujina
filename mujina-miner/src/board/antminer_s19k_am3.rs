@@ -17,7 +17,7 @@
 //! hash threads run, and the pool accepts real shares, confirmed
 //! stable at ~300 MHz for roughly 4-6 TH/s. Frequency headroom above
 //! that is the open question -- see
-//! `ChipInitStrategy::Bm1366Chain`'s doc comment in
+//! `Bm1366ChainBringUp`'s doc comment in
 //! `asic/bm13xx/thread.rs` for exactly what is and is not established.
 //! The round-by-round account, including every dead end, is
 //! `docs/s19k-pro/bring-up-log.md`; the unedited log with all wire
@@ -28,7 +28,7 @@
 //! chains together (a real hardware requirement found in Round 5: a
 //! single chain enabled alone never responds, even at correct
 //! voltage), and creates one `BM13xxThread` per chain using a
-//! chain-shaped `ChipInitStrategy::Bm1366Chain` that replays the real
+//! chain-shaped `Bm1366ChainBringUp` that replays the real
 //! captured bring-up sequence, including the switch to `bosminer`'s
 //! real 3.125 Mbaud operating speed.
 
@@ -48,19 +48,26 @@ use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::{
     api_client::types::{BoardTelemetry, PowerMeasurement, TemperatureSensor},
     asic::{
-        ChipInfo,
         bm13xx::{
-            self, BM13xxProtocol,
-            protocol::Command,
-            thread::{BM13xxThread, BaudControl, ChipInitStrategy},
+            self, chip_config,
+            command::{
+                ChainInactive, Destination, ReadRegister, RegisterCommand, SetChipAddress,
+                WriteRegister,
+            },
+            peripherals::{BoardPeripherals, ResetLine},
+            register::{ChipId, ChipModel, MidstateConfig, Register, RegisterAddress},
+            response::Response,
+            thread::{BM13xxThread, BaudControl, Bm1366ChainBringUp},
+            topology::TopologySpec,
         },
-        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
+        hash_thread::HashThread,
     },
     hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue},
     linux_hw::{BitBangI2c, LinuxI2c, SysfsGpio, SysfsGpioPin},
-    peripheral::{apw12::Apw12, tmp1075::Tmp1075},
+    peripheral::{apw12::Apw12, regulator::VoltageRegulator, tmp1075::Tmp1075},
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialStream},
+    types::Voltage,
 };
 
 inventory::submit! {
@@ -152,8 +159,8 @@ pub(crate) const EXPECTED_CHIPS: usize = 77;
 /// a different purpose (is a chain truly silent vs. garbled?) than
 /// this driver's clean typed decode, so they're intentionally
 /// separate rather than forced through one abstraction.
-pub(crate) const DOMAIN_CONFIG_WRITES: &[(u8, bm13xx::protocol::RegisterAddress, [u8; 4])] = {
-    use bm13xx::protocol::RegisterAddress::{IoDriverStrength, UartRelay};
+pub(crate) const DOMAIN_CONFIG_WRITES: &[(u8, RegisterAddress, [u8; 4])] = {
+    use RegisterAddress::{IoDriverStrength, UartRelay};
     &[
         (0x98, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
         (0x8a, IoDriverStrength, [0x02, 0x11, 0x41, 0x11]),
@@ -228,8 +235,13 @@ struct SharedChainEnable {
 }
 
 #[async_trait]
-impl AsicEnable for SharedChainEnable {
-    async fn enable(&mut self) -> Result<()> {
+impl ResetLine for SharedChainEnable {
+    /// Releases all three chains' reset together (idempotent -- see
+    /// [`SharedChainState`]). "Release" here is the new trait's name
+    /// for what this board's real hardware requirement calls
+    /// "enable": pulsing all three GPIO lines low then high, the
+    /// sequence Round 5 found is required for any chain to respond.
+    async fn release(&mut self) -> Result<()> {
         let mut state = self.state.lock().await;
         if state.enabled {
             return Ok(());
@@ -249,10 +261,41 @@ impl AsicEnable for SharedChainEnable {
         Ok(())
     }
 
-    async fn disable(&mut self) -> Result<()> {
+    /// Asserts reset on just this chain's own line, for shutdown.
+    async fn assert(&mut self) -> Result<()> {
         let mut state = self.state.lock().await;
         state.pins[self.my_index].write(PinValue::Low).await?;
         Ok(())
+    }
+}
+
+/// The S19K Pro's PSU is powered up once, up front, shared across all
+/// three chains (see `power_up_and_validate`) -- not per-thread. Every
+/// board must supply a `voltage_regulator` peripheral (see
+/// `peripherals.rs`'s `BoardPeripherals` doc comment), so this is the
+/// "fixed rail, no host-driven control" no-op it calls for.
+struct FixedPsuRail;
+
+#[async_trait]
+impl VoltageRegulator for FixedPsuRail {
+    async fn enable(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn is_enabled(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn set_voltage(&mut self, _voltage: Voltage) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_voltage(&mut self) -> Result<Voltage> {
+        Ok(Voltage::from_volts(PSU_TARGET_VOLTS))
     }
 }
 
@@ -311,7 +354,7 @@ async fn create_board() -> Result<BackplaneConnector> {
     // in the logs regardless of when (or whether) the scheduler gets
     // around to actually assigning each chain's hash thread its first
     // job -- that's a separate, later re-run of essentially the same
-    // sequence (see ChipInitStrategy::Bm1366Chain), not a dependency:
+    // sequence (see Bm1366ChainBringUp), not a dependency:
     // failure here is deliberately non-fatal, since temperature/PSU
     // telemetry and the hash threads created below are independently
     // useful even if this early check has a bad run.
@@ -359,7 +402,7 @@ async fn create_board() -> Result<BackplaneConnector> {
     // connection but sharing the same idempotent chain-enable/reset
     // state -- see SharedChainEnable. A chain whose UART fails to
     // open is skipped (logged), not fatal to the other chains.
-    let (thread_shutdown_tx, _initial_removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+    let (thread_shutdown_tx, _initial_removal_rx) = watch::channel(());
     let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
     for (chain, &tty) in CHAIN_TTYS.iter().enumerate() {
         let stream = match SerialStream::new(tty, CHAIN_BAUD) {
@@ -373,28 +416,33 @@ async fn create_board() -> Result<BackplaneConnector> {
             }
         };
         let (reader, writer, control) = stream.split();
-        let reader = FramedRead::new(reader, bm13xx::FrameCodec);
-        let writer = FramedWrite::new(writer, bm13xx::FrameCodec);
+        let reader = FramedRead::new(reader, bm13xx::FrameCodec::new(ChipModel::BM1366));
+        let writer = FramedWrite::new(writer, bm13xx::FrameCodec::new(ChipModel::BM1366));
 
         let peripherals = BoardPeripherals {
-            asic_enable: Some(Box::new(SharedChainEnable {
+            reset_line: Box::new(SharedChainEnable {
                 state: chain_state.clone(),
                 my_index: chain,
-            })),
-            voltage_regulator: None,
+            }),
+            voltage_regulator: Box::new(FixedPsuRail),
         };
 
         let thread = BM13xxThread::new(
             format!("Antminer-S19K-AM3-chain{}", chain + 1),
+            chip_config::bm1366(),
+            // Unused by this board's bring-up (see
+            // Bm1366ChainBringUp's doc comment) -- a harmless
+            // placeholder to satisfy BM13xxThread::new's signature.
+            TopologySpec::single_domain(EXPECTED_CHIPS),
             reader,
             writer,
             peripherals,
             thread_shutdown_tx.subscribe(),
-            ChipInitStrategy::Bm1366Chain {
+            Some(Bm1366ChainBringUp {
                 chip_count: EXPECTED_CHIPS as u8,
                 domain_config: DOMAIN_CONFIG_WRITES,
                 baud_control: Some(Box::new(control)),
-            },
+            }),
         );
         threads.push(Box::new(thread));
     }
@@ -452,7 +500,7 @@ async fn power_up_and_validate(
         state: chain_state.clone(),
         my_index: 0,
     }
-    .enable()
+    .release()
     .await
     .context("resetting/enabling chains")?;
 
@@ -540,51 +588,48 @@ async fn set_voltage_with_retries(psu: &mut Apw12<BitBangI2c>, volts: f32) -> Re
 /// -> per-chip domain config writes -> discover, sent *last* (not
 /// first, which is what every earlier round of this investigation had
 /// assumed and which never got a single response).
-pub(crate) async fn discover_chain(tty: &str) -> Result<Vec<ChipInfo>> {
-    use bm13xx::protocol::{Register, RegisterAddress, VersionMask};
-
+pub(crate) async fn discover_chain(tty: &str) -> Result<Vec<ChipId>> {
     let stream = SerialStream::new(tty, CHAIN_BAUD)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("opening {tty}"))?;
     let (reader, writer, _control) = stream.split();
-    let mut reader = FramedRead::new(reader, bm13xx::FrameCodec);
-    let mut writer = FramedWrite::new(writer, bm13xx::FrameCodec);
+    let mut reader = FramedRead::new(reader, bm13xx::FrameCodec::new(ChipModel::BM1366));
+    let mut writer = FramedWrite::new(writer, bm13xx::FrameCodec::new(ChipModel::BM1366));
 
     for _ in 0..3 {
         writer
-            .send(Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: Register::VersionMask(VersionMask::full_rolling()),
-            })
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
+            }))
             .await
-            .context("sending VersionMask")?;
+            .context("sending MidstateConfig")?;
         time::sleep(Duration::from_millis(15)).await;
     }
 
     writer
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::decode(RegisterAddress::InitControl, &[0x00, 0x07, 0x00, 0x00]),
-        })
+        .send(RegisterCommand::WriteRegister(WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::decode(RegisterAddress::SoftResetControl, [0x00, 0x07, 0x00, 0x00])
+                .context("decoding SoftResetControl")?,
+        }))
         .await
-        .context("sending InitControl")?;
+        .context("sending SoftResetControl")?;
     time::sleep(Duration::from_millis(15)).await;
 
     writer
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::decode(RegisterAddress::MiscControl, &[0xff, 0x0f, 0xc1, 0x00]),
-        })
+        .send(RegisterCommand::WriteRegister(WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::decode(RegisterAddress::MiscControl, [0xff, 0x0f, 0xc1, 0x00])
+                .context("decoding MiscControl")?,
+        }))
         .await
         .context("sending MiscControl")?;
     time::sleep(Duration::from_millis(15)).await;
 
     for _ in 0..3 {
         writer
-            .send(Command::ChainInactive)
+            .send(RegisterCommand::ChainInactive(ChainInactive))
             .await
             .context("sending ChainInactive")?;
         time::sleep(Duration::from_millis(15)).await;
@@ -593,29 +638,34 @@ pub(crate) async fn discover_chain(tty: &str) -> Result<Vec<ChipInfo>> {
     for i in 0..EXPECTED_CHIPS as u16 {
         let chip_address = (i * 2) as u8;
         writer
-            .send(Command::SetChipAddress { chip_address })
+            .send(RegisterCommand::SetChipAddress(SetChipAddress {
+                chip_address,
+            }))
             .await
             .context("sending SetChipAddress")?;
         time::sleep(Duration::from_millis(2)).await;
     }
 
     for &(chip_address, register_address, data) in DOMAIN_CONFIG_WRITES {
-        let register = Register::decode(register_address, &data);
+        let register =
+            Register::decode(register_address, data).context("decoding domain config register")?;
         writer
-            .send(Command::WriteRegister {
-                broadcast: false,
-                chip_address,
+            .send(RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Chip(chip_address),
                 register,
-            })
+            }))
             .await
             .context("sending domain config write")?;
         time::sleep(Duration::from_millis(2)).await;
     }
 
     writer
-        .send(BM13xxProtocol::discover_chips())
+        .send(RegisterCommand::ReadRegister(ReadRegister {
+            destination: Destination::Broadcast,
+            register_address: RegisterAddress::ChipId,
+        }))
         .await
-        .context("sending discover_chips")?;
+        .context("sending ChipId discovery read")?;
 
     let mut chips = Vec::new();
     let deadline = Instant::now() + Duration::from_millis(500);
@@ -623,16 +673,10 @@ pub(crate) async fn discover_chain(tty: &str) -> Result<Vec<ChipInfo>> {
         tokio::select! {
             response = reader.next() => {
                 match response {
-                    Some(Ok(bm13xx::Response::ReadRegister {
-                        chip_address: _,
-                        register: bm13xx::Register::ChipId { chip_type, core_count, address },
-                    })) => {
-                        chips.push(ChipInfo {
-                            chip_id: chip_type.id_bytes(),
-                            core_count: core_count.into(),
-                            address,
-                            supports_version_rolling: true,
-                        });
+                    Some(Ok(Response::ReadRegister(reply))) => {
+                        if let Register::ChipId(chip_id) = reply.register {
+                            chips.push(chip_id);
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => warn!(tty, error = %e, "decode error during discovery"),
@@ -714,7 +758,7 @@ fn spawn_monitor(
 struct AntminerS19kAm3 {
     chain_state: SharedChainStateHandle,
     psu_nen_pin: SysfsGpioPin,
-    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
+    thread_shutdown: watch::Sender<()>,
     monitor_cancel: CancellationToken,
     monitor_task: tokio::task::JoinHandle<()>,
 }
@@ -724,7 +768,7 @@ impl AntminerS19kAm3 {
         // Signal hash threads first and give them a moment to react
         // (matching bitaxe.rs's shutdown pattern) before pulling power
         // out from under them.
-        if let Err(e) = self.thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
+        if let Err(e) = self.thread_shutdown.send(()) {
             warn!(error = %e, "Failed to send shutdown signal to hash threads");
         } else {
             time::sleep(Duration::from_millis(200)).await;

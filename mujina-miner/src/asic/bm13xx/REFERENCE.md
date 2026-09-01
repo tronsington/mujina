@@ -1002,17 +1002,21 @@ Controls the hash frequency: fb_div x 25 MHz / (ref_div x post_div1
 x post_div2).
 
 ```text
- 31    28 27          16 15  14 13      8 7   4 3   0
-+-------+--------------+------+---------+-----+-----+
-| flag  |   FB_DIV     |  0   | REF_DIV | PD1 | PD2 |
-+-------+--------------+------+---------+-----+-----+
+ 31 30 29 28 27          16 15  14 13      8 7   4 3   0
++--+--+--+--+--------------+------+---------+-----+-----+
+|LK|EN|BY|VS|    FB_DIV    |  0   | REF_DIV | PD1 | PD2 |
++--+--+--+--+--------------+------+---------+-----+-----+
 ```
 
-- Bits 31-28: VCO-select flag. Bit 30 is always set and bit 28 is the
-    2400 MHz VCO select, so the top nibble reads 0x4 below 2.4 GHz and
-    0x5 at or above (byte 0x40 / 0x50).[^vcosel]
+- Bit 31 (LOCKED, LK): PLL lock report. Written 0; reads back 1 once
+    the PLL locks.[^pllfields]
+- Bit 30 (PLLEN, EN): PLL enable. 1 in every captured write.
+- Bit 29 (BYPASS, BY): PLL bypass. 0 in every captured write.
+- Bit 28 (VCOSEL, VS): 2400 MHz VCO select. 0 below 2.4 GHz, 1 at or
+    above.[^vcosel]
 - Bits 27-16: FB_DIV, a 12-bit feedback divider (top four bits zero in
     practice, fb_div staying under 256).
+- Bits 15-14: reserved, zero in every captured write.
 - Bits 13-8: REF_DIV, a 6-bit reference divider (2 in every
     captured write).
 - Bits 7-4 and 3-0: the two post dividers, each stored minus one (three
@@ -1357,9 +1361,14 @@ Configures version rolling for AsicBoost:[^midstatecfg]
 - Bits 29-28 (gen): midstate generation code, the number of midstates
     the chip generates per job. On the BM1366 and later, 1 means 8, 2
     means 12, and 3 means 16; the BM1362 uses only 1 (8 midstates). The
-    meaning of 0 is unobserved.
+    references give no meaning for 0.
 - Bits 15-0: mask of rollable version bits, applied to header version
     bits 28-13
+
+On the BM1370, the gen code reads back 0 after a write of 1; every
+other field reads back as written. Writing 0 changes nothing
+observable in a short mining run. Whether the field latches zero or
+the write takes no effect is unknown.[^genreadback]
 
 A pool's version-rolling mask, shifted right 13 bits, is the register's
 mask field. Stratum's 0x1FFFE000 becomes 0xFFFF. What version rolling
@@ -1661,8 +1670,9 @@ hash clock.[^bitaxeinit]
    +-------+--------------+------+---------+-----+-----+
    ```
 
-    - **flag** = 0x5: the high-VCO select; both endpoints run the VCO at
-        2625 MHz (FB_DIV x 25 MHz / REF_DIV)
+    - **flag** = 0x5: PLLEN (bit 30) and VCOSEL (bit 28) set; both
+        endpoints run the VCO in the high range at 2625 MHz (FB_DIV x
+        25 MHz / REF_DIV)
     - **FB_DIV** = 0x0D2 (210), **REF_DIV** = 2: shared by the
         endpoints; mid-ramp solutions vary them too
     - **PD1**, **PD2**: stored minus one, so the post dividers take the
@@ -2295,6 +2305,11 @@ work above.
 [^vcosel]: Factory firmware for the BM1362 and BM1370 confirms the 2400
     MHz threshold. The captures verify it at the boundary, where fb_div
     0xC0 with ref_div 2 is exactly 2.4 GHz and carries 0x50.
+[^pllfields]: The single-bit field names (LOCKED, PLLEN, BYPASS,
+    VCOSEL) come from the BM1362 firmware. The LOCKED readback is
+    measured on a Bitaxe BM1370: after the frequency ramp, a read
+    answers the written word with bit 31 set (flag bits 0x4 written,
+    0xC read) and every divider as written.
 [^pllranges]: The BM1362 fb_div and VCO ranges come from its firmware's
     PLL solver, which caps the VCO at 3125 MHz when ref_div is 1. The
     BM1370 VCO range comes from its firmware's solver. The BM1366/68 and
@@ -2336,6 +2351,10 @@ work above.
 [^midstatecfg]: The field names and the generation-code values follow
     reference driver code. Every host writes 0x9000FFFF (full mask,
     generation code 1, automatic generation on).
+[^genreadback]: Measured on a BM1370 during bring-up verification.
+    0xA4 written 0x9000FFFF answers 0x8000FFFF, with bit 28 cleared
+    and every other bit as written; MISC_CONTROL and TICKET_MASK read
+    back exactly as written in the same pass.
 [^adcproc]: The procedure, its pacing, and the front-end formula come
     from factory test firmware. A live BM1370 confirms all three.
 [^adcladder]: On a live BM1370, selects 4 and 5 read a base unit (about
